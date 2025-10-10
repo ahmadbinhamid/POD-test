@@ -1,0 +1,26 @@
+transformers
+diffusers
+gradio
+einops
+timm
+ultralytics
+sentencepiece
+accelerate
+easyocr
+pypdfium2
+lmdeploy
+langsmith
+pytesseract
+python-dotenv
+scikit-learn
+python-doctr[torch]
+
+# Added for runtime and service orchestration
+fastapi
+uvicorn
+openai>=1.6.0
+httpx
+requests
+pillow
+opencv-python-headless
+jinja2
