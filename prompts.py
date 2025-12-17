@@ -1,44 +1,54 @@
+"""
+prompts.py
+"""
+
 SIGNATURE_PROMPT = """
-Analyze the image carefully to identify handwritten signatures and generate JSON output.
+Analyze the image to identify handwritten signatures.
 
 **Key: `receiver_signature`**
-- Look for handwritten signatures in the "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)"
-- Check fields labeled: "SIGNATURE", "REC'D BY", "RECEIVED BY", "PRINT NAME"
-- **Important**: Only handwritten text/signatures count as "yes"
-- If only a printed name, date, or stamp is present without handwritten signature: "no"
-- If field is empty or only contains printed text: "no"
+- Look in: "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)"
+- Check fields: "SIGNATURE", "REC'D BY", "RECEIVED BY", "PRINT NAME"
+- **Important**: Only handwritten marks/scribbles count as "yes"
+- Printed names/stamps without handwriting = "no"
 
 **Values:**
-- `"yes"`: Handwritten signature is clearly present
-- `"no"`: No handwritten signature (only dates, printed names, or stamps)
+- `"yes"`: Handwritten signature clearly present
+- `"no"`: No handwritten signature
+
+**CRITICAL OUTPUT INSTRUCTIONS:**
+Return ONLY valid JSON without any markdown formatting, code blocks, or additional text.
+Do NOT wrap the response in ```json or any other markers.
 
 **Output Format:**
-```json
 {
-  "receiver_signature": "yes" | "no"
+  "receiver_signature": "yes"
 }
-```
 
-First provide reasoning explaining what you observe in signature fields, then generate JSON output.
+OR
+
+{
+  "receiver_signature": "no"
+}
+
+Analyze signature fields, then output raw JSON only - no markdown, no code blocks, no explanations.
 """
 
 BILL_OF_LADING_PROMPT = """
-Extract bill number and date from the Bill of Lading document.
+Extract bill number and date from Bill of Lading document.
 
-**Key Extraction Rules:**
+**Extraction Rules:**
 
 1. **`bill_no`**: 
-   - Look for "Bill of Lading:" label followed by a number (usually 8-9 digits)
-   - Extract ONLY the numeric value after "Bill of Lading:" 
-   - Example: "Bill of Lading: 17540697" → extract "17540697"
+   - Find: "Bill of Lading:" label + number (8-9 digits)
+   - Extract ONLY the numeric value
+   - Example: "Bill of Lading: 17540697" → "17540697"
 
 2. **`date`**:
-   - Look for dates in the "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)" only
-   - Common locations: must be inside the "RECEIVING STAMP AREA", or "Notation Area (Customer Use ONLY)" area
-   - Extract in the exact format shown (MM/DD/YYYY, MM-DD-YYYY, etc.)
-   - **Do NOT extract**: time stamps, appointment dates, or delivery dates
-   - If date is partially obscured or unclear: extract visible portion only
-   - If completely unreadable: "null"
+   - ONLY from: "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)"
+   - Extract exactly as written: "10/23/24", "10-23-2024", etc.
+   - Ignore: header dates, appointment dates, delivery dates
+   - Partial visibility: extract visible portion
+   - Completely unreadable: "null"
 
 **Output Format:**
 ```json
@@ -48,34 +58,33 @@ Extract bill number and date from the Bill of Lading document.
 }
 ```
 
-First analyze the document identifying the bill number and date locations, then generate JSON output.
+Locate bill number and date, then output JSON only.
 """
 
 CUSTOMER_ORDER_INFO_PROMPT = """
-Extract the single total order quantity from the document WITHOUT any calculation or multiplication.
+Extract total order quantity - NO CALCULATIONS ALLOWED.
 
 **Key: `total_order_quantity`**
 
-**CRITICAL RULE: DO NOT PERFORM ANY MATH OPERATIONS**
-- Find the pre-calculated total quantity value ONLY
-- Do NOT sum individual line items
-- Do NOT multiply any values
-- Do NOT add quantities together
+**CRITICAL: DO NOT CALCULATE**
+- Find pre-calculated total ONLY
+- Do NOT sum line items
+- Do NOT multiply values
+- Do NOT add columns
 
-**Extraction Priority:**
-1. **Primary**: Look for "TOTAL QTY", "TOTAL QUANTITY", or similar total fields
-2. **Secondary**: If no total field, look for a single "QTY" value (not multiple rows)
-3. **Last resort**: If multiple line items exist, extract the FIRST quantity value only
+**Priority:**
+1. "TOTAL QTY", "TOTAL QUANTITY" fields
+2. Single "QTY" value (not multiple rows)
+3. FIRST quantity value if multiple exist
 
-**Target Locations:**
-- Summary/total rows in "CUSTOMER ORDER INFORMATION" section
-- Pre-calculated total fields
-- Single quantity entries
+**Locations:**
+- "CUSTOMER ORDER INFORMATION" section totals
+- Pre-calculated summary fields
 
-**Avoid These Actions:**
-- Do NOT sum multiple rows: If you see QTY: 34, QTY: 35 → extract 34 (first value only)
-- Do NOT multiply: If you see 2 x 34 → extract 34 (not 68)
-- Do NOT add columns: QTY + HANDLING QTY → use QTY only
+**Avoid:**
+- Summing rows: QTY: 34, QTY: 35 → use 34 only
+- Multiplying: 2 x 34 → use 34 only
+- Adding columns: QTY + HANDLING → use QTY only
 
 **Output Format:**
 ```json
@@ -84,350 +93,381 @@ Extract the single total order quantity from the document WITHOUT any calculatio
 }
 ```
 
-Find the single total quantity value without performing any mathematical operations, then generate JSON output.
+Find total quantity value, then output JSON only.
 """
 
 STAMP_LATEST_PROMPT = """
-**Advanced Bill of Lading Stamp Analysis**
+STAMP EXTRACTION - PRECISION MODE
 
-Analyze the "RECEIVING STAMP AREA", "Notation Area (Customer Use ONLY)" section meticulously. Extract information using these precise rules:
+Extract data from RECEIVING STAMP or NOTATION AREA.
 
-### Field Extraction Guidelines:
+SEARCH ZONES (check BOTH):
+1. "RECEIVING STAMP AREA"
+2. "Notation Area (Customer Use ONLY)"
 
-1. **stamp_exist**: 
-   - **SEARCH CRITERIA**: Look for "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)" section or stamp impressions 
-   - **STAMP INDICATORS**: Rectangular/circular stamp marks, company logos, official seals 
-   - **VALUES**: "yes" (stamp area/impression found) | "no" (no stamp area) 
+═══════════════════════════════════════════════════════════════
 
-2. **seal_intact**: 
-   - **KEYWORD TARGETS**: "Seal(s) Intact Y/N", "SEAL INTACT Y N", "Seal Intact? Y N" 
-   - **CRITICAL RULE**: ONLY process if you find these EXACT field labels
-   - **DETECTION METHOD**: Look for Y/N options, checkboxes, circles 
-   - **MARKED INDICATORS**: 
-     - "Y" circled/checked/marked = "yes" 
-     - "N" circled/checked/marked = "no" 
-     - Field present but unmarked = "empty" 
-   - **IMPORTANT**: If you don't find these EXACT field labels, return "null"
-   - **VALUES**: "yes" | "no" | "empty" | "null"
+EXTRACTION RULES:
+
+1. **stamp_exist**:
+   • Look for: stamp impressions, ink marks, rectangular/circular stamps
+   • "yes" = any stamp visible
+   • "no" = no stamp
+
+2. **seal_intact**:
+   • ONLY if EXACT text: "Seal(s) Intact Y/N" or "SEAL INTACT Y N"
+   • Check marked letter: Y or N
+   • "yes" = Y marked/circled
+   • "no" = N marked/circled
+   • "empty" = field exists, nothing marked
+   • "null" = field does NOT exist
 
 3. **pod_date**:
-   - **KEYWORD TARGETS**: "DATE", "Date", "Signed Date", "Pick Up Appointment Date & Time", "Driver Arrival Time"
-   - **LOCATION**: Must be inside "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)" (ignore header dates)
-   - **POSITION ASSOCIATION**: Accept handwritten/printed values **to the right OR directly below** the keyword
-   - **FORMAT PRESERVATION**: Extract exactly as handwritten/printed
-   - **DATE REGEX**: Match short and long formats: `\d{1,2}[-/]\d{1,2}[-/]\d{2,4}`
-   - **VALUES**: "<date_string>" | "empty" | "null"
+   • Find: "DATE", "Signed Date", Pick Up Appointment Date & Time, date next to signature
+   • Must be in stamp/notation area (not header)
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
 
-4. **pod_sign** (Signature Detection):
-   - **KEYWORD TARGETS**: "Signature", "PRINT", "RECEIVED BY", "Receiver Signature", "Rec'd by", etc.
-   - **SIGNATURE CRITERIA**:
-     - Any handwritten scribbles, cursive, initials, or full names written by hand
-     - Accept as `"yes"` even if OCR normalizes cursive into letters
-   - **EXCLUSIONS**: Only reject if the field is blank or filled with a printed/stamped label (not handwriting)
-   - **VALUES**: "yes" (handwritten content) | "no" (printed only) | "empty" (field present but blank) | "null" (field absent)
+4. **pod_sign**:
+   • Find: "SIGNATURE", "RECEIVED BY", "REC'D BY", "PRINT NAME"
+   • "yes" = any handwritten marks/scribbles
+   • "no" = only printed text/stamps
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
 
-5. **total_received**:
-   **STEP 1 - FIND CARTON LABELS ONLY:**
-   Look for these exact words/phrases (case-insensitive):
-   - "CARTONS" 
-   - "TOT CS REC"
-   - "TOTAL CARTONS"
-   - "Ctns Received" 
-   - "Ctns. Received"
+5. **total_received** (CARTONS ONLY):
 
-   **STEP 2 - GET NUMBER NEXT TO LABEL:**
-   - Extract the number immediately after/below the carton label
-   - Must be same line or directly below in same box
-
-   **STEP 3 - IGNORE THESE COMPLETELY:**
-   - Any number after "PALLET", "PLT", "PLTS" 
-   - Any number after "APPT", "APPOINTMENT", "Appointment #", "APPOINTMENT #"
-   - Any number after "TRAILER", "TRL", "UNIT" "TRAILER #'S", "Trailer #", "TRAILER #"
-   - Any number after "SEAL #'S", "Seal Number", "seal"
-   - Any number after "BDC", "DC" followed by 4 digits
-   - Any 4-digit number that looks like time (1504, 1430, etc.)
-   - Any standalone 4-digit number without a carton label
-
-   **STEP 4 - RETURN VALUES:**
-   - If carton label found with number → return the number
-   - If carton label found but no number → "empty"  
-   - If no carton label found → "null"
-
-   **CRITICAL RULE:** 
-   Only extract numbers that are directly associated with carton/cases labels("CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns Received", "Ctns. Received") 
-   If there's any doubt about what the number represents, return "null".
+   CRITICAL: DISTINGUISH BETWEEN PALLETS AND CARTONS
+   
+   STEP 1 - Identify what type of label you see:
+   
+   A) CARTON LABELS (what we WANT):
+      • "TOT CS REC" or "TOTAL CS REC"
+      • "CARTONS" or "TOTAL CARTONS"
+      • "Ctns Received" or "Ctns. Received"
+      • "Ctns Delivered" or "# Ctns Delivered"
+      • "CASES RECEIVED"
+   
+   B) PALLET LABELS (what to IGNORE):
+      • "TOT PLTS" or "TOTAL PLTS"
+      • "PALLETS" or "TOT PALLETS"
+      • "PLTS" or "PLT"
+      • Any label containing "PALLET" or "PLT"
+   
+   STEP 2 - VALIDATION CHECK (Use number value to verify):
+   • If unclear, look at the actual text more carefully
+   
+   STEP 3 - When you see "TOT CS REC" or similar:
+   • First verify the number next to it
+   • If number is small (1-20), re-examine if this might actually be "TOT PLTS"
+   • Double-check the letters: Does it really say "CS"
+   
+   STEP 4 - Extract ONLY if you confirmed it's CARTONS:
+   • Take the number next to the CARTON label
+   • ALWAYS take the FIRST number (leftmost) before any text/symbols
+   
+   STEP 5 - ALWAYS IGNORE:
+   • Any number next to "TOT PLTS", "PALLETS", "PLT"
+   • "APPT", "APPOINTMENT #"
+   • "TRAILER #", "UNIT #"
+   • "SEAL #"
+   • 4-digit numbers (times: 1504, 1430)
+   • DC numbers (DC1234)
+   
+   OUTPUT:
+   • <integer> = carton number found AND VERIFIED
+   • "empty" = carton label exists but no number written
+   • "null" = carton label field does NOT exist
 
 6. **damage**:
-   - **KEYWORD TARGETS**: "DAMAGED", "Damage Kept", "D", "Damage", "Cartons Damaged", "Ctns Damaged", "Ctns. Damaged" 
-   - **EXTRACTION RULE**: Look for NUMBERS in damage fields 
-   - **VALIDATION**: Must be integer or zero, not letters 
-   - **VALUES**: <integer> | "empty" | "null" 
- 
-7. **short**: 
-   - **KEYWORD TARGETS**: "SHORT", "S", "Short", "S", "Cartons Short", "Ctns Short", "Ctns. Short" 
-   - **EXTRACTION RULE**: Look for NUMBERS in short fields 
-   - **VALUES**: <integer> | "empty" | "null" 
- 
-8. **over**: 
-   - **KEYWORD TARGETS**: "OVER", "O", "Over", "O" 
-   - **EXTRACTION RULE**: Look for NUMBERS in over fields 
-   - **VALUES**: <integer> | "empty" | "null" 
- 
-9. **refused**: 
-   - **KEYWORD TARGETS**: "Total Cases Rejected", "REFUSED", "ROC Damage", "ROC Damage", "R", "ROC Damage Return On Carrier" 
-   - **EXTRACTION RULE**: Look for NUMBERS in refused/ROC fields 
-   - **VALUES**: <integer> | "empty" | "null"
+   • Find: "DAMAGED", "Damage Kept", "Damage", "Cartons Damaged", "# Ctns Damaged", "D"
+   • Extract: integer only
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
 
-### CRITICAL VALIDATION RULES: 
-- **Single Letter Field Detection**: 
-  - "D" field = damage quantity (look for number next to/below "D") 
-  - "S" field = short quantity (look for number next to/below "S") 
-  - "O" field = over quantity (look for number next to/below "O") 
-  - "R" field = refused quantity (look for number next to/below "R") 
-- **Number Extraction from Single Letter Fields**: Extract the HANDWRITTEN NUMBER associated with each letter field 
-- **Field Presence Logic**: 
-  - null = field doesn't exist in stamp area 
-  - empty = field exists but no value written/blank 
-  - <integer> = field has numeric value written 
-- **Stamp Area Focus**: Only extract from receiving stamp area or "Notation Area (Customer Use ONLY)" ignore other document sections 
-- **Avoid Confusion Sources**: 
-  - **For total_received**: Ignore appointment numbers, pallet counts, reference numbers, trailer, seal and other numbers only consider these labels("CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns Received", "Ctns. Received")
-  - **For all fields**: Focus on stamp area only, not document body
-- **SEAL INTACT STRICT RULE**: 
-  - ONLY return "yes"/"no" if you find EXACTLY: "Seal(s) Intact Y/N", "SEAL INTACT Y N", or "Seal Intact? Y N"
-  - If you see ANY other seal-related text (like "Seal Intact", "Seal Status", etc.), return "null"
-  - This prevents false positives from similar but different fields
+7. **short**:
+   • Find: "SHORT", "Cartons Short", "# Ctns Short", "S"
+   • Extract: integer only
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
 
-### Output Format:
-```json
+8. **over**:
+   • Find: "OVER", "# Ctns Over", "O"
+   • Extract: integer only
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
+
+9. **refused**:
+   • Find: "REFUSED", "ROC Damage", "Total Cases Rejected", "R"
+   • Extract: integer only
+   • "empty" = field exists but blank
+   • "null" = field does NOT exist
+
+10. **roc_damaged**:
+    • Find: "ROC Damage", "ROC DAMAGED"
+    • Extract: integer only
+    • "empty" = field exists but blank
+    • "null" = field does NOT exist
+
+11. **damaged_kept**:
+    • Find: "Damage Kept", "DAMAGED KEPT"
+    • Extract: integer only
+    • "empty" = field exists but blank
+    • "null" = field does NOT exist
+
+12. **notation_exist**:
+   CRITICAL: Look for the EXACT text "Notation Area (Customer Use ONLY)" or "Notation Area (Customer Use Only)"
+   
+   This is a specific header text, NOT a general section.
+   
+   MUST SEE:
+   • The exact words: "Notation Area"
+   • Followed by: "(Customer Use ONLY)" or "(Customer Use Only)"
+   • This appears as a header/title in the document
+   
+   DO NOT confuse with:
+   • Regular receiving stamp areas
+   • Customer information sections
+   • Any section that just has customer fields
+   • Stamp boxes without "Notation Area" text
+   
+   DECISION RULE:
+   • Can you see the text "Notation Area" anywhere? 
+     - YES → return "yes"
+     - NO → return "no"
+   
+   OUTPUT:
+   • "yes" = Text "Notation Area (Customer Use ONLY)" is clearly visible
+   • "no" = This specific text is NOT present (default to "no" if unsure)
+   
+   IMPORTANT: Default to "no" unless you are 100% certain you see "Notation Area" text
+
+═══════════════════════════════════════════════════════════════
+
+CRITICAL RULES:
+• Focus ONLY on stamp/notation areas
+• Extract numbers, NOT formulas (34, not "2x34")
+• "null" = field does NOT exist
+• "empty" = field exists but has no value/blank
+• <value> = actual data found
+
+**CRITICAL OUTPUT INSTRUCTIONS:**
+Return ONLY valid JSON without any markdown formatting, code blocks, or additional text.
+Do NOT wrap the response in ```json, ```java, ```javascript or any other markers.
+Do NOT include explanations, descriptions, or any text before or after the JSON.
+
+OUTPUT FORMAT (raw JSON only):
 {
+  "stamp_exist": "yes",
+  "seal_intact": "yes",
   "pod_date": "<string>" | "empty" | "null",
-  "pod_sign": "yes" | "no" | "empty" | "null", 
-  "stamp_exist": "yes" | "no",
-  "seal_intact": "yes" | "no" | "empty" | "null",
-  "damage": <integer> | "empty" | "null",
-  "short": <integer> | "empty" | "null", 
-  "over": <integer> | "empty" | "null",
-  "refused": <integer> | "empty" | "null",
+  "pod_sign": "yes",
   "total_received": <integer> | "empty" | "null",
-  "roc_damaged": <integer> | "empty" | "null",
-  "damaged_kept": <integer> | "empty" | "null"
+  "damage": 0,
+  "short": 0,
+  "over": 0,
+  "refused": 0,
+  "roc_damaged": 0,
+  "damaged_kept": 0,
+  "notation_exist": "no"
 }
-```
 
-**Analysis Process:**
-1. First, identify if the receiving stamp area or "Notation Area (Customer Use ONLY)" exists
-2. For each field, determine: Is field present? What value is written?
-3. Distinguish between handwritten numbers and letter labels (S, D, O, R)
-4. Provide detailed reasoning for each extraction
-5. Generate final JSON
+Think step-by-step, then output raw JSON only - no markdown, no code blocks, no explanations.
 """
 
 DELIVERY_RECEIPT_PROMPT = """
-**Delivery Receipt Analysis - Enhanced Accuracy**
+Extract information from delivery receipt document.
 
-Extract information from delivery receipt documents with precise field identification.
+EXTRACTION RULES:
 
-### Key Extraction Rules:
+1. **pod_date**:
+   • Target: date fields in "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)"
+   • Include: receipt dates, delivery dates, confirmation dates
+   • Exclude: "Avail Date", "Sched Date", "Date Unloaded"
+   • Format: preserve exactly as written
+   • "<date_string>" | "empty" | "null"
 
-1. **`pod_date`**:
-   - **Target locations**: Date fields inside "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)" area
-   - **Include**: Receipt dates, delivery dates, confirmation dates
-   - **Exclude**: "Avail Date", "Sched Date", "Date Unloaded" 
-   - **Format**: Preserve original format exactly
-   - **Values**: "<date_string>" | "empty" | "null"
+2. **pod_sign**:
+   • Target: "Target Signature", "RECVR", receiver signature areas
+   • Detect: handwritten marks, scribbles, initials
+   • Exclude: "Driver Signature"
+   • "yes" | "no" | "empty" | "null"
 
-2. **`pod_sign`**:
-   - **Target fields**: "Target Signature", "RECVR", receiver signature areas
-   - **Signature detection**: Any handwritten marks, scribbles, or initials
-   - **Exclude**: "Driver Signature" fields
-   - **Values**: "yes" (signed) | "no" (unsigned) | "empty" (blank field) | "null" (no field)
+3. **total_received**:
+   • Target: "CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns. Received", "Ctns Received", "Ctns Delivered"
+   • Extract: handwritten numbers only
+   • Exclude: "SEAL #'S", "APPOINTMENT #", "TRAILER #'S", "PALLETS", "PLTS"
+   • Multiple values: extract individually
+   • <integer> | [<integer>] | "empty" | "null"
 
-3. **`total_received`**:
-   - **Target fields**: "CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns Received", "Ctns. Received"
-   - **Extraction**: Handwritten numbers in received quantity fields
-   - **Exclude**: "SEAL #'S", "APPOINTMENT #", "TRAILER #'S", "Pallets", "PALLETS", "PLTS", "TOT CS PLT", "TOT CS PLTS"
-   - **Multiple values**: If multiple line items, extract individual numbers
-   - **Values**: <integer> | [<integer>, <integer>] | "empty" | "null"
+4. **damage**:
+   • Target: "External Dam'g Recv'd", "Damaged Received"
+   • Extract: damage quantities
+   • <integer> | [<integer>] | "empty" | "null"
 
-4. **`damage`**:
-   - **Target fields**: "External Dam'g Recv'd", "Damaged Received"
-   - **Extraction**: Handwritten damage quantities
-   - **Values**: <integer> | [<integer>, <integer>] | "empty" | "null"
+5. **refused**:
+   • Target: "Returned to Carrier", "Refused"
+   • Extract: returned/refused quantities
+   • <integer> | [<integer>] | "empty" | "null"
 
-5. **`refused`**:
-   - **Target fields**: "Returned to Carrier", "Refused"
-   - **Extraction**: Quantities returned/refused
-   - **Values**: <integer> | [<integer>, <integer>] | "empty" | "null"
+6. **customer_order_num**:
+   • Target: "Src / PO" column, "IN TIME"/"OUT TIME" sections
+   • Criteria: 10-15 digit numbers, may contain "/"
+   • Multiple: extract all
+   • "<string>" | ["<string>"] | "null"
 
-6. **`customer_number`**:
-   - **Target locations**: "Src / PO" column, "IN TIME"/"OUT TIME" sections
-   - **Criteria**: Numbers 10-15 digits long, may contain "/"
-   - **Multiple values**: Extract all, separate with commas
-   - **Values**: "<string>" | "<string1>,<string2>" | "null"
+CRITICAL RULES:
+• "null" = field does NOT exist
+• "empty" = field exists but has no value/blank
+• <value> = actual data found
 
-### Output Format:
-```json
+**CRITICAL OUTPUT INSTRUCTIONS:**
+Return ONLY valid JSON without any markdown formatting, code blocks, or additional text.
+Do NOT wrap the response in ```json, ```java, ```javascript or any other markers.
+
+OUTPUT FORMAT (raw JSON only):
 {
   "pod_date": "<string>" | "empty" | "null",
-  "pod_sign": "yes" | "no" | "empty" | "null", 
-  "total_received": <integer> | [<integer>] | "empty" | "null",
-  "damage": <integer> | [<integer>] | "empty" | "null",
-  "refused": <integer> | [<integer>] | "empty" | "null",
-  "customer_number": "<string>" | "null"
+  "pod_sign": "yes",
+  "total_received":  <integer> | [<integer>] | "empty" | "null",
+  "damage": 0,
+  "refused": 0,
+  "customer_order_num": "<string>" | ["<string>"] | "null"
 }
-```
 
-First analyze each target field location and content, then generate JSON output.
+Analyze fields, then output raw JSON only - no markdown, no code blocks, no explanations.
 """
 
 RECEIPT_DATE_PROMPT = """
-**Receipt Date Extraction - High Precision**
+Extract date from receipt document.
 
-Extract the primary date from the receipt document.
+**pod_date**:
+• Location: "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)"
+• Format: extract exactly as written (MM/DD/YYYY, MM/DD/YY, MM-DD-YYYY)
+• Exclude: "Avail Date", "Sched Date", "Date Unloaded", appointment dates
+• Partial dates: extract visible portion
+• "<date_string>" | "empty" | "null"
 
-**Key: `pod_date`**:
-- **Location**: inside the "RECEIVING STAMP AREA" or "Notation Area (Customer Use ONLY)" area
-- **Format preservation**: Extract exactly as written (MM/DD/YYYY, MM/DD/YY, MM-DD-YYYY, etc.)
-- **Exclusions**: Ignore "Avail Date", "Sched Date", "Date Unloaded", appointment dates
-- **Partial dates**: If some digits unclear, extract visible portion
-- **Values**: "<date_string>" | "empty" (field present but blank) | "null" (no date field)
-
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
   "pod_date": "<string>" | "empty" | "null"
 }
 ```
 
-First locate and read the date field, then generate JSON output.
+Locate date field, then output JSON only.
 """
 
 RECEIPT_SIGNATURE_PROMPT = """
-**Signature Detection - Enhanced Precision**
+Detect handwritten signature in receiver fields.
 
-Detect handwritten signatures in receiver fields.
+**pod_sign**:
+• Target: "Target Signature", "RECVR", receiver signature areas
+• Criteria: handwritten marks, scribbles, initials, cursive
+• Include: even brief handwritten marks
+• Exclude: "Driver Signature", printed names only
+• "yes" = present with handwriting
+• "no" = present but unsigned
+• "empty" = present but blank
+• "null" = field not found
 
-**Key: `pod_sign`**:
-- **Target fields**: "Target Signature", "RECVR", receiver signature areas
-- **Signature criteria**: Any handwritten marks, scribbles, initials, or cursive text
-- **Include**: Even brief handwritten marks that indicate signing
-- **Exclude**: "Driver Signature", printed names only
-- **Field states**: 
-  - Present with handwritten content: "yes"
-  - Present but unsigned: "no" 
-  - Present but blank: "empty"
-  - Field not found: "null"
-
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
   "pod_sign": "yes" | "no" | "empty" | "null"
 }
 ```
 
-First examine signature fields for handwritten content, then generate JSON output.
+Examine signature fields, then output JSON only.
 """
 
 RECEIPT_TOTAL_RECEIVED_PROMPT = """
-**Total Received Quantity Extraction**
-
 Extract received quantities from receipt tables.
 
-**Key: `total_received`**:
-- **Target column**: "CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns Received", "Ctns. Received"
-- **Extraction method**: List all integer values from the received column only consider these labels("CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns Received", "Ctns. Received")
-- **Exclude columns**: "Sched" (scheduled quantities) , "PLTS", "TOT CS PLT", "TOT CS PLTS", "Appointment #", "Trailer #", "TRAILER #'S", SEAL #'S "Trailer", "zip code" 
-- **Multiple rows**: Extract each row's received quantity separately
-- **Values**: [<int1>, <int2>, ...] | "empty" (column present, no values) | "null" (no column)
+**total_received**:
+• Target: "CARTONS", "TOT CS REC", "TOTAL CARTONS", "Ctns. Received", "Ctns Received", "Ctns Delivered"
+• Method: list all integers from received column
+• Exclude: "Sched", "PLTS", "TOT CS PLT", "Appointment #", "Trailer #", "SEAL #'S"
+• Multiple rows: extract each separately
+• [<integer>] | "empty" | "null"
 
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
   "total_received": [<integer>] | "empty" | "null"
 }
 ```
 
-First locate received quantity column and extract all values, then generate JSON output.
+Locate received column, then output JSON only.
 """
 
 RECEIPT_DAMAGE_PROMPT = """
-**Damage Quantity Extraction**
-
 Extract damage quantities from receipt tables.
 
-**Key: `damage`**:
-- **Target column**: "External Dam'g Rcv'd", damage-related columns
-- **Extraction method**: List all integer values from damage columns
-- **Exclude**: "Returned to Carrier" columns
-- **Multiple rows**: Extract each damage quantity separately
-- **Values**: [<int1>, <int2>, ...] | "empty" (column present, no values)
+**damage**:
+• Target: "External Dam'g Rcv'd", damage-related columns
+• Method: list all integers from damage columns
+• Exclude: "Returned to Carrier"
+• Multiple rows: extract each separately
+• [<integer>] | "empty"
 
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
   "damage": [<integer>] | "empty"
 }
 ```
 
-First locate damage columns and extract all integer values, then generate JSON output.
+Locate damage columns, then output JSON only.
 """
 
 RECEIPT_REFUSED_PROMPT = """
-**Refused/Returned Items Extraction**
+Extract returned/refused quantities from table.
 
-Extract quantities returned to carrier from table.
+**refused**:
+• Target: "Returned to Carrier" or similar columns
+• Extract: all integers in refused/returned column
+• Each number = items returned for that row
+• Accept: handwritten and printed numbers
+• [<integer>] | "empty"
 
-**Task**: Analyze table rows for "Returned to Carrier" information.
-
-**Key: `refused`**:
-- **Target column**: "Returned to Carrier" or similar
-- **Extraction**: All integers written in the refused/returned column
-- **Row analysis**: Each number represents items returned for that row
-- **Handwritten/printed**: Accept both handwritten and printed numbers
-- **Values**: [<int1>, <int2>, ...] | "empty" (column present, no values)
-
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
-  "text": "<all_visible_text_in_image>",
   "refused": [<integer>] | "empty"
 }
 ```
 
-First identify the returned to carrier column, extract all integers, then generate JSON with reasoning.
+Identify returned column, then output JSON only.
 """
 
 RECEIPT_CUSTOMER_ORDER_NUMBER_PROMPT = """
-**Customer Order Number Extraction - Enhanced Detection**
+Extract customer order numbers from receipt.
 
-Extract customer order numbers based on receipt format type.
+**customer_order_num**:
 
-**Key: `customer_order_num`**:
+SHORT RECEIPTS:
+• Target: numbers near "IN TIME", "OUT TIME" labels
+• Characteristics: ~12 digits (minimum 10)
+• Multiple: extract all found
 
-### Short Receipts:
-- **Target fields**: Numbers under/near "IN TIME", "OUT TIME" labels
-- **Characteristics**: ~12 digit numbers (minimum 10 digits)
-- **Layout**: May be vertical or horizontal arrangement
-- **Multiple values**: Extract all customer numbers found
+LONG RECEIPTS:
+• Target: "SRC / PO" column
+• Format: numbers with "/" (extract part after "/")
+• Multiple rows: extract from each
 
-### Long Receipts:  
-- **Target column**: "SRC / PO" column
-- **Format**: Numbers with "/" separator (extract part after "/")
-- **Multiple rows**: Extract from each row with customer data
+RULES:
+• Length: only numbers ≥10 digits
+• Exclude: numbers with "-" hyphen (123415-12)
+• Format: preserve "/" if present
+• Multiple: return as array
 
-### General Rules:
-- **Length filter**: Only numbers ≥10 digits (customer order numbers are long)
-- **Exclusions**: Skip numbers with "-" (hyphen) like "123415-12"
-- **Format**: Clean numbers, preserve "/" if part of customer format
-- **Multiple values**: Return as array if multiple numbers found
-
-**Output Format:**
+OUTPUT FORMAT:
 ```json
 {
-  "customer_order_num": ["<string1>", "<string2>"] | "<string>" | "null"
+  "customer_order_num": ["<string>"] | "<string>" | "null"
 }
 ```
 
-First identify receipt type and locate customer number fields, then generate JSON output.
+Identify receipt type and locate customer numbers, then output JSON only.
 """

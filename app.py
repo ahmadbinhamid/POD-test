@@ -155,6 +155,7 @@ import asyncio
 from ultralytics import YOLO
 
 import concurrent.futures
+import logging
 
 
 import models
@@ -164,6 +165,13 @@ from main import run_ocr
 load_dotenv()
 
 app = FastAPI(default_response_class=ORJSONResponse)
+
+# Basic structured logging for API
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("app")
 
 # Enable CORS
 app.add_middleware(
@@ -194,7 +202,7 @@ async def gpu_worker():
             job["future"].set_exception(e)
         finally:
             YOLO_QUEUE.task_done()
-
+ 
 # Launch the GPU worker(s) at startup
 @app.on_event("startup")
 async def startup_event():
@@ -203,6 +211,13 @@ async def startup_event():
     num_workers = int(os.environ.get("GPU_WORKERS", 4))
     for _ in range(num_workers):
         asyncio.create_task(gpu_worker())
+
+# Shutdown handler to clean up resources
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down ThreadPoolExecutor...")
+    CPU_POOL.shutdown(wait=True, cancel_futures=False)
+    logger.info("ThreadPoolExecutor shut down complete")
 
 # This section with commented-out code seems unused in your final endpoint.
 # You can remove it for clarity if it's no longer needed.
@@ -243,11 +258,14 @@ async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODRespons
     """
     try:
         # 1. Run the core OCR and analysis logic for one file
+        logger.info(f"\n\n🎯 STARTING SINGLE OCR REQUEST\nRequest ID: {ocr_request.id}\nFile path: {ocr_request.file_url_or_path}")
         result_items = await run_ocr_async(ocr_request.file_url_or_path)
+        logger.info(f"\n\n✅ COMPLETED SINGLE OCR REQUEST\nRequest ID: {ocr_request.id}\nItems generated: {len(result_items)}\n\n")
 
         # 2. Map the results to the PODResponse model, adding the specific _id
         responses = []
         for item in result_items:
+            logger.info(f"\n\n📋 FINAL POD FIELDS FOR REQUEST {ocr_request.id}\nB/L Number: {item.get('B/L Number')}\nStamp Exists: {item.get('Stamp Exists')}\nPOD Date: {item.get('POD Date')}\nReceived Qty: {item.get('Received Qty')}\nDamage Qty: {item.get('Damage Qty')}\nShort Qty: {item.get('Short Qty')}\nOver Qty: {item.get('Over Qty')}\nRefused Qty: {item.get('Refused Qty')}\nStatus: {item.get('Status')}\nNotation Exists: {item.get('Notation Exists')}\n\n")
             response_dict = {
                 "B_L_Number": item.get("B/L Number"),
                 "Stamp_Exists": item.get("Stamp Exists"),
@@ -261,6 +279,7 @@ async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODRespons
                 "Over_Qty": item.get("Over Qty"),
                 "Refused_Qty": item.get("Refused Qty"),
                 "Customer_Order_Num": item.get("Customer Order Num"),
+                "Notation_Exists": item.get("Notation Exists"),
                 "Status": item.get("Status"),
                 "_id": ocr_request.id  # Attach the ID from the original request
             }
@@ -271,10 +290,7 @@ async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODRespons
     except Exception as e:
         # Log the error with context and re-raise it so asyncio.gather can catch it.
         # This prevents one failed file from crashing the entire batch.
-        print(f"Error processing request with id='{ocr_request.id}': {e}")
-        # Optionally, you can import traceback and print print_exc() for more detail
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Error processing request id={ocr_request.id}: {e}")
         # Re-raising the exception is important for the gathering logic
         raise e
 
@@ -283,34 +299,99 @@ async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODRespons
 @app.post("/run-ocr", response_model=List[PODResponse])
 async def analyze_images_concurrently(ocr_requests: List[OCRRequest]):
     """
-    Accepts a list of OCR requests and processes them concurrently.
+    Accepts a list of OCR requests and processes them concurrently with memory-aware batching.
     """
-    # Create a concurrent task for each request in the input list
-    tasks = [process_single_ocr_request(req) for req in ocr_requests]
+    import torch
 
-    # Run all tasks concurrently and gather their results.
-    # return_exceptions=True ensures that if one task fails, the others continue.
-    # The result for the failed task will be the exception object itself.
+    logger.info(f"\n\n🚀 BATCH OCR PROCESSING START - {len(ocr_requests)} requests\n")
+
+    # Memory-aware processing: check GPU memory before starting
+    if torch.cuda.is_available():
+        try:
+            memory_total = torch.cuda.get_device_properties(0).total_memory
+            memory_allocated = torch.cuda.memory_allocated()
+            memory_free = memory_total - memory_allocated
+            memory_free_gb = memory_free / (1024**3)
+            memory_utilization = (memory_allocated / memory_total) * 100
+
+            logger.info(
+                f"GPU Memory Status:\n"
+                f"  Total: {memory_total / (1024**3):.2f}GB\n"
+                f"  Allocated: {memory_allocated / (1024**3):.2f}GB\n"
+                f"  Free: {memory_free_gb:.2f}GB\n"
+                f"  Utilization: {memory_utilization:.1f}%"
+            )
+
+            # Adjust processing strategy based on available memory
+            if memory_free_gb < 3:  # Less than 3GB free
+                logger.warning(
+                    f"Low GPU memory ({memory_free_gb:.2f}GB free). "
+                    "Processing sequentially with memory cleanup."
+                )
+
+                # Process sequentially with aggressive memory cleanup
+                final_responses = []
+                failures = []
+
+                for idx, req in enumerate(ocr_requests):
+                    logger.info(f"Processing request {idx + 1}/{len(ocr_requests)}: {req.id}")
+
+                    try:
+                        result = await process_single_ocr_request(req)
+                        final_responses.extend(result)
+                    except Exception as e:
+                        logger.error(f"Request {req.id} failed: {e}")
+                        failures.append({"error": str(e)})
+
+                    # Clear cache after each request
+                    torch.cuda.empty_cache()
+                    logger.info(f"Memory after cleanup: {torch.cuda.memory_allocated() / (1024**3):.2f}GB")
+
+                if not final_responses and ocr_requests:
+                    ids = [getattr(req, 'id', None) for req in ocr_requests]
+                    logger.error(f"All batch items failed. ids={ids}; failures={failures}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "message": "All OCR requests in the batch failed to process.",
+                            "ids": ids,
+                            "failures": failures,
+                        }
+                    )
+
+                return final_responses
+
+        except Exception as e:
+            logger.warning(f"Could not check GPU memory: {e}. Proceeding with normal processing.")
+
+    # Normal concurrent processing (sufficient memory available)
+    logger.info("Sufficient memory available. Processing concurrently.")
+    tasks = [process_single_ocr_request(req) for req in ocr_requests]
     results_from_gather = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Flatten the list of lists into a single list of responses,
-    # while filtering out any exceptions that occurred.
+    # Flatten the list of lists into a single list of responses
     final_responses = []
+    failures = []
     for result in results_from_gather:
         if isinstance(result, Exception):
-            # The error is already logged in the helper function.
-            # We just skip adding it to the successful responses.
+            failures.append({"error": str(result)})
             continue
-        # `result` is a List[PODResponse], so we use extend.
         final_responses.extend(result)
 
-    # If all tasks failed, it might be a server-side issue.
+    # If all tasks failed, it might be a server-side issue
     if not final_responses and ocr_requests:
-         raise HTTPException(
-             status_code=500,
-             detail="All OCR requests in the batch failed to process. Check server logs for details."
-         )
+        ids = [getattr(req, 'id', None) for req in ocr_requests]
+        logger.error(f"All batch items failed. ids={ids}; failures={failures}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "All OCR requests in the batch failed to process.",
+                "ids": ids,
+                "failures": failures,
+            }
+        )
 
+    logger.info(f"\n✅ BATCH OCR COMPLETE - Processed {len(final_responses)} successful responses\n")
     return final_responses
 
 # ====================================================================

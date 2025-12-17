@@ -1,0 +1,57 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv_broken/
+env/
+
+# Cache
+.cache/
+Models/
+*.cache
+
+# Builds
+build/
+dist/
+dist_api/
+dist_pixtral/
+dist_lmdeploy/
+dist_package/
+07-Oct-2024/
+POD_OCR_Windows_*/
+*.egg-info/
+*.tar.gz
+*.zip
+*.run
+payload.tar.gz
+
+# Logs
+*.log
+nohup.out
+services.log
+
+# Temporary
+tmp/
+stamps/
+uploads/
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+models/
+ClientPackage_Linux
+
+# Specs
+EOF

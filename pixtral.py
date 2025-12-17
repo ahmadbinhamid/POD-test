@@ -13,11 +13,33 @@ import models
 from langsmith import traceable
 import asyncio  # <--- ADDED THIS IMPORT
 from datetime import datetime
+from contextlib import asynccontextmanager
+ 
 
-# Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
 openai_api_base = f"http://localhost:23333/v1"
-app = FastAPI()
+
+# Global OpenAI client
+_openai_client = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown"""
+    global _openai_client
+    # Startup: Create shared OpenAI client
+    print("Starting up: Creating shared AsyncOpenAI client...")
+    _openai_client = AsyncOpenAI(
+        api_key=openai_api_key,
+        base_url=openai_api_base,
+    )
+    yield
+    # Shutdown: Close OpenAI client
+    print("Shutting down: Closing AsyncOpenAI client...")
+    if _openai_client:
+        await _openai_client.close()
+    print("AsyncOpenAI client closed successfully")
+
+app = FastAPI(lifespan=lifespan)
 
 
 def image_to_base64(image: str) -> str:
@@ -33,9 +55,12 @@ def image_to_base64(image: str) -> str:
     # Simplified and corrected the image loading logic
     image_val = None
     if image.startswith("http://") or image.startswith("https://"):
-        with requests.get(image) as response:
+        response = requests.get(image, timeout=10)
+        try:
             response.raise_for_status()
             image_val = Image.open(BytesIO(response.content)).convert("RGB")
+        finally:
+            response.close()
     elif image.startswith("data:image"):
         header, base64_data = image.split(",", 1)
         image_val = Image.open(BytesIO(base64.b64decode(base64_data))).convert("RGB")
@@ -58,15 +83,12 @@ def image_to_base64(image: str) -> str:
 @traceable(run_type="tool", name="llm-response-reasoning", dangerously_allow_filesystem=True)
 @app.post("/pixtral-inference", response_model=models.InterVL2Response)
 async def run_inference(request:models.InterVL2Request):
-    client = AsyncOpenAI(
-        # defaults to os.environ.get("OPENAI_API_KEY")
-        api_key=openai_api_key,
-        base_url=openai_api_base,
-    ) 
-    llms =await client.models.list()
+    global _openai_client
+    client = _openai_client
+    llms = await client.models.list()
     model = llms.data[0].id
     # image_base64 = image_to_base64(request.image_url_or_path_or_base64)
-    chat_completion_from_base64 =await client.chat.completions.create(
+    chat_completion_from_base64 = await client.chat.completions.create(
         messages=[{
             "role":
             "user",
@@ -101,10 +123,8 @@ async def run_batch_inference(requests: list[models.InterVL2Request]):
 
     print(f"new request come /batch-pixtral-inference : {datetime.now()}")
 
-    client = AsyncOpenAI( # Correct: Use AsyncOpenAI for async operations
-        api_key=openai_api_key,
-        base_url=openai_api_base,
-    )
+    global _openai_client
+    client = _openai_client
 
     llms = await client.models.list()
     model_id = llms.data[0].id

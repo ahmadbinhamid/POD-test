@@ -1,40 +1,36 @@
-
-
-
-
-
+"""
+Optimized Main OCR Processing Module
+Handles BOL and Receipt document processing with YOLO detection and VLM OCR
+"""
 import os
 import json
-import requests
-import numpy as np
+import re
+import logging
 from datetime import datetime, timedelta
-from PIL import Image
-from jinja2 import Template
-import threading
-from typing import List, Dict
-from pydantic import BaseModel
-import torch
+from typing import List, Dict, Optional, Tuple
+from collections import defaultdict, Counter
 from pathlib import Path
+from io import BytesIO
+import base64
+import copy
+
+# Third-party imports
+import numpy as np
+import cv2
+import torch
+import httpx
+from PIL import Image
+from pydantic import BaseModel
 from fastapi import HTTPException
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from ultralytics.utils.plotting import save_one_box
-from io import BytesIO
-import base64
-import re
-from langsmith import traceable
-from collections import defaultdict, Counter
-import copy
-from dotenv import load_dotenv
-import cv2
 from doctr.io import DocumentFile
 from doctr.models import page_orientation_predictor, mobilenet_v3_small_page_orientation
-from doctr.models._utils import estimate_orientation
-import httpx      # Added for asynchronous HTTP requests
-import asyncio    # Added for async capabilities
+from langsmith import traceable
+from dotenv import load_dotenv
 
-
-# Import utility functions
+# Local imports
 from utils import (
     dynamic_preprocess,
     build_transform,
@@ -45,37 +41,86 @@ from utils import (
     preprocess_date,
     process_customer_numbers,
     adjust_date,
-    resize_large_image
+    resize_large_image,
+    safe_int_conversion,
+    safe_str_conversion,
+    safe_numeric_operation,
+    normalize_ocr_data,
+    heuristic_stamp_crop_base64
 )
 import models
 import prompts
 
-# Configuration
-OCR_PORT = 3203
+# ============================================================================
+# CONFIGURATION & INITIALIZATION
+# ============================================================================
+
 load_dotenv()
+OCR_PORT = 3203
 
-
-bol_region_detector = YOLO("Models/bol_regions_best.pt").to("cpu")
-page_classifier = YOLO("Models/doc_classify_best.pt").to("cpu")
-receipt_region_detector = YOLO("Models/receipts_regions_best.pt").to("cpu")
-stamp_detector = YOLO("Models/stamp_existence.pt").to("cpu")
-
-    # Initialize page orientation detection
-page_det_model = mobilenet_v3_small_page_orientation(
-        pretrained=False, 
-        pretrained_backbone=False
-    )
-page_det_params = torch.load("Models/page_orientation.pt", map_location="cpu")
-page_det_model.load_state_dict(page_det_params)
-page_orient_predictor = page_orientation_predictor(
-    arch=page_det_model, 
-    pretrained=False
+# Configure logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-# Ensure temporary directory exists
-os.makedirs("./tmp", exist_ok=True)
+logger = logging.getLogger("main")
 
-# Model mappings
-region2model = {
+# Ensure tmp directory exists
+Path("./tmp").mkdir(exist_ok=True)
+
+
+class DetectionConfig:
+    """Centralized detection configuration"""
+    RECEIPT_CONF = 0.45
+    BOL_CONF = 0.60
+    PAGE_CONF = 0.60
+    STAMP_CONF = 0.75
+    IOU_THRESHOLD = 0.40
+    MIN_REGION_SIZE = (80, 80)
+    BLUR_THRESHOLD = 100
+
+
+class ModelRegistry:
+    """Centralized model loading and management"""
+    
+    def __init__(self):
+        self.bol_region_detector = None
+        self.page_classifier = None
+        self.receipt_region_detector = None
+        self.stamp_detector = None
+        self.page_orient_predictor = None
+        self._load_models()
+    
+    def _load_models(self):
+        """Load all ML models once at initialization"""
+        logger.info("🔄 Loading ML models...")
+        
+        # YOLO models
+        self.bol_region_detector = YOLO("Models/bol_regions_best.pt").to("cpu")
+        self.page_classifier = YOLO("Models/doc_classify_best.pt").to("cpu")
+        self.receipt_region_detector = YOLO("Models/receipts_regions_best.pt").to("cpu")
+        self.stamp_detector = YOLO("Models/stamp_existence.pt").to("cpu")
+        
+        # Page orientation model
+        page_det_model = mobilenet_v3_small_page_orientation(
+            pretrained=False, 
+            pretrained_backbone=False
+        )
+        page_det_params = torch.load("Models/page_orientation.pt", map_location="cpu")
+        page_det_model.load_state_dict(page_det_params)
+        self.page_orient_predictor = page_orientation_predictor(
+            arch=page_det_model, 
+            pretrained=False
+        )
+        
+        logger.info("✅ All models loaded successfully")
+
+
+# Initialize models globally
+MODEL_REGISTRY = ModelRegistry()
+
+# Region to Model mappings
+REGION_TO_MODEL = {
     "carrier": models.CarrierInfo,
     "stamp": models.Stamp,
     "customer_order_info": models.CustomerOrderInfo,
@@ -84,8 +129,8 @@ region2model = {
     "date": models.DeliveryReceipt,
 }
 
-# Prompt mappings
-region2prompt = {
+# Region to Prompt mappings
+REGION_TO_PROMPT = {
     "stamp": prompts.STAMP_LATEST_PROMPT,
     "customer_order_info": prompts.CUSTOMER_ORDER_INFO_PROMPT,
     "signatures": prompts.SIGNATURE_PROMPT,
@@ -99,244 +144,399 @@ region2prompt = {
     "pod_sign": prompts.RECEIPT_SIGNATURE_PROMPT,
 }
 
+# BOL class names
+BOL_CLASS_NAMES = {
+    0: "stamp",
+    1: "bill_of_lading",
+    2: "customer_order_info",
+    3: "signatures",
+}
+
+# Receipt class names
+RECEIPT_CLASS_NAMES = {
+    0: "customer_order_num",
+    1: "damage",
+    2: "pod_date",
+    3: "total_received",
+    4: "refused",
+    6: "pod_sign",
+}
+
+# Page classification names
+PAGE_CLASS_NAMES = {
+    0: "BOL",
+    1: "others",
+    2: "receipt"
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def validate_image_quality(image: Image.Image, min_size: Tuple[int, int] = (100, 100)) -> bool:
+    """
+    Validate if image meets minimum quality requirements
+    
+    Args:
+        image: PIL Image to validate
+        min_size: Minimum (width, height) tuple
+    
+    Returns:
+        bool: True if image passes quality checks
+    """
+    if image.width < min_size[0] or image.height < min_size[1]:
+        logger.warning(f"Image too small: {image.size}")
+        return False
+    
+    # Check blur using Laplacian variance
+    img_array = np.array(image.convert('L'))
+    laplacian_var = cv2.Laplacian(img_array, cv2.CV_64F).var()
+    
+    if laplacian_var < DetectionConfig.BLUR_THRESHOLD:
+        logger.warning(f"Image too blurry: {laplacian_var:.2f}")
+        return False
+    
+    return True
+
+
+def log_detection_stats(results: List[Results], detection_type: str) -> None:
+    """Log detection statistics for debugging"""
+    if results and len(results) > 0 and results[0].boxes:
+        confidences = results[0].boxes.conf.tolist()
+        if confidences:
+            logger.info(
+                f"{detection_type} - Detections: {len(confidences)}, "
+                f"Avg Conf: {np.mean(confidences):.2f}, "
+                f"Min: {min(confidences):.2f}, Max: {max(confidences):.2f}"
+            )
+
+
+def log_extraction_summary(ocr_response: dict, region_name: str) -> None:
+    """Log summary of extracted data for debugging"""
+    if region_name == "stamp":
+        logger.info(f"""
+╔═══════════════════════════════════════════════════════╗
+║ 📋 STAMP EXTRACTION SUMMARY                           ║
+╠═══════════════════════════════════════════════════════╣
+║ total_received: {str(ocr_response.get('total_received', 'N/A')):<35} ║
+║ pod_date:       {str(ocr_response.get('pod_date', 'N/A')):<35} ║
+║ pod_sign:       {str(ocr_response.get('pod_sign', 'N/A')):<35} ║
+║ damage:         {str(ocr_response.get('damage', 'N/A')):<35} ║
+║ short:          {str(ocr_response.get('short', 'N/A')):<35} ║
+║ over:           {str(ocr_response.get('over', 'N/A')):<35} ║
+║ refused:        {str(ocr_response.get('refused', 'N/A')):<35} ║
+║ stamp_exist:    {str(ocr_response.get('stamp_exist', 'N/A')):<35} ║
+║ seal_intact:    {str(ocr_response.get('seal_intact', 'N/A')):<35} ║
+║ notation_exist: {str(ocr_response.get('notation_exist', 'N/A')):<35} ║
+╚═══════════════════════════════════════════════════════╝
+        """)
+
+
+# ============================================================================
+# IMAGE PROCESSING FUNCTIONS
+# ============================================================================
+
 @traceable(run_type="tool", name="straighten-img", dangerously_allow_filesystem=True)
-async def straighten_img(img: Image.Image):
+async def straighten_img(img: str) -> dict:
     """
     Straighten an image using document orientation detection
+    
     Args:
         img: Base64 encoded image string
+    
     Returns:
-        dict: Containing straightened image, rotation angle, and confidence
+        dict: Contains straightened image, rotation angle, and confidence
     """
-    # img=base64topil(img)
-    # docs = DocumentFile.from_images(save_image_to_tmp_dir(img))
-    docs = DocumentFile.from_images(save_image_to_tmp_dir(base64topil(img)))
-
-    _, classes, probs = zip(page_orient_predictor(docs))
+    pil_img = base64topil(img)
+    docs = DocumentFile.from_images(save_image_to_tmp_dir(pil_img))
+    
+    _, classes, probs = zip(MODEL_REGISTRY.page_orient_predictor(docs))
     page_orientations = [(cls, prob) for cls, prob in zip(classes[0], probs[0])]
     angle, confidence = page_orientations[0]
-    img =base64topil(img)
+    
+    rotated_img = pil_img.rotate(angle, expand=True, resample=Image.BICUBIC)
+    
     return {
-        "img": convert_image_to_base64(
-            img.rotate(angle, expand=True, resample=Image.BICUBIC)
-        ),
+        "img": convert_image_to_base64(rotated_img),
         "angle": angle,
         "confidence": confidence,
     }
 
+
+async def pdf_to_images(
+    pdf_path_or_bytes,
+    max_pages: int = 100,
+    max_scale: int = 4
+) -> List[Image.Image]:
+    """
+    Convert PDF to list of PIL Images with dynamic scaling based on page count
+    Includes fallback to pdf2image if PDFium fails (for corrupt PDFs)
+
+    Args:
+        pdf_path_or_bytes: PDF file path or bytes
+        max_pages: Maximum number of pages to process
+        max_scale: Maximum rendering scale
+
+    Returns:
+        List of PIL Images
+    """
+    import pypdfium2 as pdfium
+    import gc
+
+    # Try PDFium first (faster, better quality)
+    try:
+        pdf = pdfium.PdfDocument(pdf_path_or_bytes)
+        page_count = len(pdf)
+
+        # Validate page count
+        if page_count > max_pages:
+            raise ValueError(f"PDF has too many pages: {page_count}. Maximum allowed: {max_pages}")
+
+        # Calculate appropriate scale based on page count to reduce memory usage
+        if page_count > 50:
+            scale = 2  # Large multi-page PDFs - reduced quality for memory
+        elif page_count > 20:
+            scale = 3  # Medium PDFs - balanced quality/memory
+        else:
+            scale = max_scale  # Small PDFs - best quality
+
+        logger.info(f"Processing PDF with PDFium: {page_count} pages at scale={scale}")
+
+        images = []
+
+        # Process pages in batches to reduce memory pressure for large PDFs
+        batch_size = 10 if page_count > 20 else page_count
+
+        for batch_start in range(0, page_count, batch_size):
+            batch_end = min(batch_start + batch_size, page_count)
+
+            if page_count > 20:
+                logger.info(f"Processing pages {batch_start + 1}-{batch_end} of {page_count}")
+
+            for i in range(batch_start, batch_end):
+                page = pdf[i]
+                rendered_image = page.render(scale=scale).to_pil()
+                resized_image = resize_large_image(rendered_image)
+                images.append(resized_image)
+
+            # Clear memory after each batch for large PDFs
+            if page_count > 20:
+                gc.collect()
+
+        logger.info(f"✅ PDFium processing complete: {len(images)} pages rendered")
+        return images
+
+    except Exception as pdfium_error:
+        # PDFium failed - try fallback to pdf2image (more forgiving parser)
+        logger.warning(f"⚠️ PDFium failed: {str(pdfium_error)}")
+        logger.info("Attempting fallback to pdf2image (Poppler-based parser)...")
+
+        try:
+            from pdf2image import convert_from_bytes, convert_from_path
+            from pathlib import Path
+
+            # Use appropriate converter based on input type
+            if isinstance(pdf_path_or_bytes, (str, Path)) and os.path.isfile(str(pdf_path_or_bytes)):
+                logger.info(f"Converting from path: {pdf_path_or_bytes}")
+                pages = convert_from_path(
+                    pdf_path_or_bytes,
+                    dpi=200,  # Lower DPI to save memory (200 instead of 300)
+                    fmt='jpeg',
+                    thread_count=2
+                )
+            else:
+                logger.info(f"Converting from bytes: {len(pdf_path_or_bytes)} bytes")
+                pages = convert_from_bytes(
+                    pdf_path_or_bytes,
+                    dpi=200,
+                    fmt='jpeg',
+                    thread_count=2
+                )
+
+            # Validate page count
+            if len(pages) > max_pages:
+                logger.warning(f"PDF has {len(pages)} pages, truncating to {max_pages}")
+                pages = pages[:max_pages]
+
+            # Resize images
+            resized_pages = [resize_large_image(page) for page in pages]
+
+            logger.info(f"✅ pdf2image fallback successful: {len(resized_pages)} pages rendered")
+            return resized_pages
+
+        except ImportError:
+            logger.error("❌ pdf2image not installed. Cannot use fallback parser.")
+            logger.error("Install with: pip install pdf2image && apt-get install poppler-utils")
+            raise ValueError(
+                f"Failed to load document (PDFium: {str(pdfium_error)}). "
+                f"Fallback parser (pdf2image) not available."
+            )
+        except Exception as fallback_error:
+            logger.error(f"❌ pdf2image fallback also failed: {str(fallback_error)}")
+            raise ValueError(
+                f"Failed to load document (PDFium: {str(pdfium_error)}). "
+                f"Fallback also failed (pdf2image: {str(fallback_error)})"
+            )
+
+
+# ============================================================================
+# REGION DETECTION FUNCTIONS
+# ============================================================================
+
 @traceable(run_type="tool", name="detect-regions-receipt", dangerously_allow_filesystem=True)
-def receipt_detect_regions(image: Image) -> models.ReceiptRegions:
+def receipt_detect_regions(image: str) -> models.ReceiptRegions:
     """
     Detect and extract regions from receipt images
-    Args:
-        image: Input image to process
-    Returns:
-        ReceiptRegions: Object containing detected region images
-    """
-    # Define region mapping
-    class_names = {
-        0: "customer_order_num",
-        1: "damage",
-        2: "pod_date",
-        3: "total_received",
-        4: "refused",
-        6: "pod_sign",  # Note: class 5 ('sched') is skipped
-    }
     
-    # Detect regions using YOLO model
-    results: List[Results] = receipt_region_detector.predict(
+    Args:
+        image: Base64 encoded image
+    
+    Returns:
+        ReceiptRegions object with detected regions
+    """
+    results: List[Results] = MODEL_REGISTRY.receipt_region_detector.predict(
         base64topil(image), 
-        conf=0.8
+        conf=DetectionConfig.RECEIPT_CONF,
+        iou=DetectionConfig.IOU_THRESHOLD
     )
     
-    # Process detected regions
+    log_detection_stats(results, "Receipt Region Detection")
+    
     boxes = {}
+    region_scores = {}
+    
     for result in results:
-        for class_id, box in zip(result.boxes.cls.tolist(), result.cpu().boxes.xyxy):
-            if class_id in list(class_names.keys()):
-                boxes[class_names[class_id]] = convert_image_to_base64(
-                    make_image_square(
-                        Image.fromarray(
-                            save_one_box(box, im=result.orig_img, save=False)
-                        )
+        for class_id, box, conf in zip(
+            result.boxes.cls.tolist(), 
+            result.cpu().boxes.xyxy,
+            result.boxes.conf.tolist()
+        ):
+            if class_id in RECEIPT_CLASS_NAMES:
+                region_name = RECEIPT_CLASS_NAMES[class_id]
+                
+                # Keep highest confidence detection per region
+                if region_name not in region_scores or conf > region_scores[region_name]:
+                    cropped = Image.fromarray(
+                        save_one_box(box, im=result.orig_img, save=False)
                     )
-                )
+                    
+                    if validate_image_quality(cropped, min_size=DetectionConfig.MIN_REGION_SIZE):
+                        boxes[region_name] = convert_image_to_base64(make_image_square(cropped))
+                        region_scores[region_name] = conf
+                        logger.info(f"Detected {region_name} with confidence: {conf:.2f}")
+                    else:
+                        logger.warning(f"Rejected {region_name} due to poor quality")
+    
     return models.ReceiptRegions(**boxes)
 
-@traceable(run_type="tool", name="detect-regions-bol", dangerously_allow_filesystem=True)
-def bol_detect_regions(image: Image) -> models.Regions:
-    """
-    Detect and extract regions from Bill of Lading (BOL) images
-    Args:
-        image: Input image to process
-    Returns:
-        Regions: Object containing detected region images
-    """
-    # Define region mapping
-    class_names = {
-        0: "stamp",
-        1: "bill_of_lading",
-        2: "customer_order_info",
-        3: "signatures",
-    }
 
-    # Detect regions using YOLO model
-    results: List[Results] = bol_region_detector.predict(base64topil(image), conf=0.51)
+@traceable(run_type="tool", name="detect-regions-bol", dangerously_allow_filesystem=True)
+def bol_detect_regions(image: str) -> models.Regions:
+    """
+    Detect and extract regions from BOL images
+    
+    Args:
+        image: Base64 encoded image
+    
+    Returns:
+        Regions object with detected regions
+    """
+    results: List[Results] = MODEL_REGISTRY.bol_region_detector.predict(
+        base64topil(image), 
+        conf=DetectionConfig.BOL_CONF,
+        iou=DetectionConfig.IOU_THRESHOLD
+    )
+    
+    log_detection_stats(results, "BOL Region Detection")
+    
+    # Log detected regions
+    detected_regions = []
+    for result in results:
+        if result.boxes:
+            for class_id, conf in zip(result.boxes.cls.tolist(), result.boxes.conf.tolist()):
+                if class_id in BOL_CLASS_NAMES:
+                    detected_regions.append(f"{BOL_CLASS_NAMES[class_id]} (conf: {conf:.2f})")
+    
+    logger.info(f"\n🎯 BOL REGIONS DETECTED: {detected_regions}\n")
+    
     boxes = {}
+    region_scores = {}
     
     for result in results:
         orig_img = result.orig_img
         h, w, _ = orig_img.shape
-
-        for class_id, box in zip(result.boxes.cls.tolist(), result.cpu().boxes.xyxy):
-            x1, y1, x2, y2 = map(int, box)
+        
+        for class_id, box, conf in zip(
+            result.boxes.cls.tolist(), 
+            result.cpu().boxes.xyxy,
+            result.boxes.conf.tolist()
+        ):
+            region_name = BOL_CLASS_NAMES[class_id]
             
-            # Special handling for bill_of_lading region
-            if class_names[class_id] == "bill_of_lading":
-                x1, y1 = 0, 0  # Extend to top-left corner
-                x2 = min(x2, w)  # Limit to image width
-                y2 = min(y2, h)  # Limit to image height
-            
-            # Convert coordinates to tensor for save_one_box
-            box_tensor = torch.tensor([x1, y1, x2, y2])
-            cropped_img = save_one_box(box_tensor, im=orig_img, save=False)
-            
-            boxes[class_names[class_id]] = convert_image_to_base64(
-                Image.fromarray(cropped_img)
-            )
+            # Keep highest confidence detection per region
+            if region_name not in region_scores or conf > region_scores[region_name]:
+                x1, y1, x2, y2 = map(int, box)
+                
+                # Special handling for bill_of_lading - extend to corners
+                if region_name == "bill_of_lading":
+                    x1, y1 = 0, 0
+                    x2 = min(x2, w)
+                    y2 = min(y2, h)
+                
+                box_tensor = torch.tensor([x1, y1, x2, y2])
+                cropped_img = save_one_box(box_tensor, im=orig_img, save=False)
+                cropped_pil = Image.fromarray(cropped_img)
+                
+                if validate_image_quality(cropped_pil, min_size=DetectionConfig.MIN_REGION_SIZE):
+                    boxes[region_name] = convert_image_to_base64(cropped_pil)
+                    region_scores[region_name] = conf
+                    logger.info(f"Detected {region_name} with confidence: {conf:.2f}")
+                else:
+                    logger.warning(f"Rejected {region_name} due to poor quality")
     
     return models.Regions(**boxes)
 
-async def pdf_to_images(pdf_path_or_bytes):
+
+async def bol_stamp_exist(image: str) -> str:
     """
-    Convert PDF file or bytes to list of PIL Images
+    Detect if stamp exists in BOL image
+    
     Args:
-        pdf_path_or_bytes: Path to PDF file or PDF bytes
+        image: Base64 encoded image
+    
     Returns:
-        list: List of PIL Images
+        'yes' or 'no' indicating stamp presence
     """
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(pdf_path_or_bytes)
-    images = []
+    class_names = {0: "no", 1: "yes"}
+    results = MODEL_REGISTRY.stamp_detector.predict(
+        base64topil(image), 
+        conf=DetectionConfig.STAMP_CONF
+    )
     
-    for i in range(len(pdf)):
-        page = pdf[i]
-        # Render page at higher resolution
-        rendered_image = page.render(scale=4).to_pil()
-        # Resize if image is too large
-        resized_image =resize_large_image(rendered_image)
-        images.append(resized_image)
+    log_detection_stats(results, "Stamp Detection")
     
-    return images
-
-# Removed the individual `ocr` and `ocr_request` functions as `batch_ocr` will replace their use.
-# @traceable(run_type="llm", name="OCR", dangerously_allow_filesystem=True)
-# def ocr(image, question, port=None):
-#     ...
-# @traceable(run_type="llm", name="OCR", dangerously_allow_filesystem=True)
-# async def ocr_request(ocr_batch: models.OCRBatch, port=None):
-#     ...
-
-@traceable(run_type="llm", name="OCR-Batch", dangerously_allow_filesystem=True)
-async def batch_ocr(ocr_batches: List[models.OCRBatch], port=None) -> List[models.OCRBatchResponse]:
-    """
-    Process multiple OCR requests as a single batch using pixtral's batch inference endpoint.
-    This replaces the previous client-side concurrency with a single HTTP batch request.
-    """
-    global OCR_PORT
-    url = f"http://localhost:{port or OCR_PORT}/batch-pixtral-inference"
-
-    # Prepare requests for the batch endpoint
-    pixtral_requests = []
-    # Store metadata to reconstruct OCRBatchResponse later
-    metadata_list = []
-    for ocr_batch in ocr_batches:
-        # The pixtral service expects the base64 string without the "data:image/jpeg;base64," prefix
-        image_data = ocr_batch.image.split(",")[1] if "," in ocr_batch.image else ocr_batch.image
-        
-        pixtral_requests.append(models.InterVL2Request(
-            image_url_or_path_or_base64=image_data,
-            prompt=ocr_batch.prompt
-        ))
-        metadata_list.append({
-            "page_type": ocr_batch.page_type,
-            "region_name": ocr_batch.region_name,
-            "stamp_exist": ocr_batch.stamp_exist
-        })
-
-    if not pixtral_requests:
-        return []
-
-    try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            # Send a single POST request with a list of InterVL2Request objects
-            response = await client.post(url, json=[req.model_dump() for req in pixtral_requests])
-            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-        
-        # Parse the list of InterVL2Response objects from the batch response
-        pixtral_batch_responses = [models.InterVL2Response(**item) for item in response.json()]
-
-        final_ocr_responses = []
-        for i, pixtral_resp in enumerate(pixtral_batch_responses):
-            metadata = metadata_list[i]
-            json_to_parse = pixtral_resp.response
-            
-            # Extract JSON content from response (same logic as original ocr_request)
-            pattern = r"```json(.*?)```"
-            match = re.search(pattern, json_to_parse, re.DOTALL)
-            if match:
-                json_to_parse = match.group(1)
-            json_content = json_to_parse.strip("```json").strip("```").replace("'null'", "null")
-            
-            final_ocr_responses.append(
-                models.OCRBatchResponse(
-                    page_type=metadata["page_type"],
-                    region_name=metadata["region_name"],
-                    ocr_response=json.loads(json_content),
-                    stamp_exist=metadata["stamp_exist"]
-                )
-            )
-        return final_ocr_responses
-
-    except httpx.HTTPStatusError as e:
-        print(f"HTTP error during batch OCR: {e.response.status_code} - {e.response.text}")
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"Batch OCR service error: {e.response.text}"
-        )
-    except httpx.RequestError as e:
-        print(f"Network error during batch OCR: {e}")
-        raise HTTPException(
-            status_code=503,
-            detail=f"Batch OCR service unreachable or network error: {e}"
-        )
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error from Pixtral batch response: {e}. Raw response: {response.text}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid JSON response from batch OCR service: {e}"
-        )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Unexpected error in batch_ocr: {str(e)}")
+    for result in results:
+        classes = result.boxes.cls.tolist()
+        if classes:
+            class_idx = safe_int_conversion(classes[0], 0)
+            return class_names[class_idx]
+    
+    return "no"
 
 
-def classify_documents(images):
+def classify_documents(images: List[str]) -> Dict[str, List[str]]:
     """
     Classify document types in images
+    
     Args:
         images: List of base64 encoded images
-    Returns:
-        dict: Classified document regions by type
-    """
-    class_names = {0: "BOL", 1: "others", 2: "receipt"}
-    processed_images = []
-
-    print(f"start of classify _documents: {datetime.now()}")
     
-    # Process and validate images
+    Returns:
+        Dictionary of classified regions by type
+    """
+    logger.info(f"📄 Starting document classification: {datetime.now()}")
+    
+    processed_images = []
     for image in images:
         try:
             pil_image = base64topil(image)
@@ -344,7 +544,7 @@ def classify_documents(images):
                 pil_image = resize_large_image(pil_image)
                 processed_images.append(pil_image)
         except Exception as e:
-            print(f"Error processing image: {e}")
+            logger.error(f"Error processing image: {e}")
             continue
     
     if not processed_images:
@@ -353,551 +553,1034 @@ def classify_documents(images):
             detail="No valid images to process after resizing"
         )
     
-    # Classify document regions
-    results: List[Results] = page_classifier.predict(processed_images, conf=0.55)
-    boxes = defaultdict(list)
+    results: List[Results] = MODEL_REGISTRY.page_classifier.predict(
+        processed_images, 
+        conf=DetectionConfig.PAGE_CONF
+    )
     
+    log_detection_stats(results, "Page Classification")
+    
+    boxes = defaultdict(list)
     for result in results:
         if result.boxes:
-            for class_id, box in zip(
-                result.boxes.cls.tolist(),
-                result.cpu().boxes.xyxy
-            ):
-                if class_id in list(class_names.keys()):
-                    boxes[class_names[class_id]].append(
+            for class_id, box in zip(result.boxes.cls.tolist(), result.cpu().boxes.xyxy):
+                if class_id in PAGE_CLASS_NAMES:
+                    boxes[PAGE_CLASS_NAMES[class_id]].append(
                         convert_image_to_base64(
-                            Image.fromarray(
-                                save_one_box(box, im=result.orig_img, save=False)
-                            )
+                            Image.fromarray(save_one_box(box, im=result.orig_img, save=False))
                         )
                     )
-    print(f"End of classify _documents: {datetime.now()}")
+    
+    logger.info(f"📄 Document classification complete: {datetime.now()}")
+    return dict(boxes)
 
-    return boxes
 
-def preprocess_image(img):
+# ============================================================================
+# DATA VALIDATION & CLEANING
+# ============================================================================
+
+def validate_and_clean_stamp_data(ocr_response: dict, region_name: str) -> dict:
     """
-    Enhance image quality for better OCR results
+    Validate and clean stamp OCR responses
+    
     Args:
-        img: PIL Image to process
+        ocr_response: Raw OCR response
+        region_name: Name of the region
+    
     Returns:
-        PIL Image: Processed image
+        Cleaned OCR response
     """
-    image = np.array(img)
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Apply Gaussian blur
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Apply adaptive thresholding
-    threshold = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
-    # Apply morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    sharpened = cv2.morphologyEx(threshold, cv2.MORPH_GRADIENT, kernel)
-    return Image.fromarray(sharpened)
+    if region_name != "stamp":
+        return ocr_response
+    
+    cleaned = ocr_response.copy()
+    
+    # Validate total_received
+    total_received = cleaned.get("total_received")
+    
+    # Parse patterns like "208 cases, 9=4, 70 ctns"
+    if total_received and isinstance(total_received, str):
+        match = re.match(r'^(\d+)', total_received.strip())
+        if match:
+            total_received = safe_int_conversion(match.group(1), "null")
+            cleaned["total_received"] = total_received
+    
+    # Filter suspicious values (likely false positives)
+    suspicious_values = [226, 3511, 2028, 2098, 1504, 1430, 1424, 412113, 287868]
+    
+    if isinstance(total_received, (int, str, float)):
+        try:
+            # Handle all numeric types safely
+            total_rec_int = safe_int_conversion(total_received, None)
+            
+            if total_rec_int is not None:
+                if total_rec_int in suspicious_values:
+                    logger.warning(f"⚠️ Suspicious total_received: {total_received}")
+                    cleaned["total_received"] = "null"
+                elif len(str(total_rec_int)) == 4 and total_rec_int > 1000:
+                    logger.warning(f"⚠️ 4-digit number {total_received} likely NOT cartons")
+                    cleaned["total_received"] = "null"
+                elif total_rec_int > 99999:
+                    logger.warning(f"⚠️ Number {total_received} too large for carton count")
+                    cleaned["total_received"] = "null"
+        except Exception as e:
+            logger.warning(f"⚠️ Error validating total_received: {e}")
+            pass
+    
+    # Validate pod_date
+    pod_date = cleaned.get("pod_date")
+    example_dates = ["10/23/24", "10-23-2024", "OCT 23 2024", "OCT 23, 2024", 
+                     "OCT - 23, 2024", "OCT / 23, 2024", "10/22/24", "9/16/25"]
+    
+    if pod_date in example_dates:
+        logger.warning(f"⚠️ pod_date matches prompt example: {pod_date}")
+        cleaned["pod_date"] = "empty"
+    
+    if pod_date and pod_date not in ["null", "empty", None]:
+        try:
+            date_str = str(pod_date).replace("-", "/")
+            parts = date_str.split("/")
+            
+            if len(parts) >= 2:
+                first_num = safe_int_conversion(parts[0], 0)
+                second_num = safe_int_conversion(parts[1], 0)
+                
+                if first_num > 31 or second_num > 31:
+                    logger.warning(f"⚠️ Invalid date values: {pod_date}")
+                    cleaned["pod_date"] = "null"
+                elif first_num > 12 and second_num > 12:
+                    logger.warning(f"⚠️ Invalid date: {pod_date}")
+                    cleaned["pod_date"] = "null"
+        except Exception as e:
+            logger.warning(f"⚠️ Error validating pod_date: {e}")
+            pass
+    
+    # Validate damage/short/over/refused
+    for field in ["damage", "short", "over", "refused", "roc_damaged", "damaged_kept"]:
+        value = cleaned.get(field)
+        
+        if value in ["D", "S", "O", "R", "d", "s", "o", "r"]:
+            logger.warning(f"⚠️ {field} is just a letter")
+            cleaned[field] = "empty"
+        
+        if isinstance(value, (int, str, float)):
+            try:
+                val_int = safe_int_conversion(value, None)
+                if val_int is not None:
+                    if val_int < 0:
+                        logger.warning(f"⚠️ {field} value {val_int} is negative")
+                        cleaned[field] = "null"
+                    elif val_int > 10000:
+                        logger.warning(f"⚠️ {field} value {val_int} unreasonably high")
+                        cleaned[field] = "null"
+            except Exception as e:
+                logger.warning(f"⚠️ Error validating {field}: {e}")
+                pass
+    
+    # Validate seal_intact
+    seal_intact = cleaned.get("seal_intact")
+    if seal_intact in ["yes", "no"] and cleaned.get("stamp_exist") == "no":
+        logger.warning("⚠️ seal_intact has value but no stamp exists")
+        cleaned["seal_intact"] = "null"
+    
+    # Log notation area detection
+    stamp_exist = cleaned.get("stamp_exist")
+    if stamp_exist == "no":
+        has_data = any([
+            cleaned.get("pod_date") not in ["null", "empty", None],
+            cleaned.get("pod_sign") not in ["null", "empty", None],
+            cleaned.get("total_received") not in ["null", "empty", None]
+        ])
+        if has_data:
+            logger.info("✓ Notation area detected (stamp_exist='no' but data present)")
+    
+    return cleaned
 
-def merge_bol_data(data):
+
+# ============================================================================
+# BOL DATA MERGING
+# ============================================================================
+
+def calculate_data_quality_score(bol: dict) -> int:
+    """
+    Calculate quality score for a BOL entry
+    
+    Args:
+        bol: BOL data dictionary
+    
+    Returns:
+        Quality score (higher is better)
+    """
+    score = 0
+    stamp = bol.get("stamp", {})
+    
+    # Critical fields
+    if stamp.get("pod_date") not in ["null", "empty", "", None]:
+        pod_date = str(stamp["pod_date"])
+        if "/" in pod_date and len(pod_date) >= 8:
+            score += 50
+        elif pod_date.isdigit() and len(pod_date) <= 2:
+            score += 5
+        else:
+            score += 20
+    
+    if stamp.get("total_received") not in ["null", "empty", "", 0, None]:
+        score += 40
+    
+    # Important fields
+    if stamp.get("pod_sign") not in ["null", "empty", "", None]:
+        score += 15
+    
+    if stamp.get("stamp_exist") == "yes":
+        score += 10
+    
+    # Discrepancy fields
+    for field in ["damage", "short", "over", "refused"]:
+        if stamp.get(field) not in ["null", "empty", "", None]:
+            score += 5
+    
+    # Other fields
+    if stamp.get("seal_intact") not in ["null", "empty", "", None]:
+        score += 5
+    
+    if stamp.get("notation_exist") not in ["null", "empty", "", None]:
+        score += 5
+    
+    return score
+
+
+def merge_bol_data(data: List[dict]) -> List[dict]:
     """
     Merge multiple BOL entries for the same bill number
+    
     Args:
         data: List of BOL data entries
+    
     Returns:
-        list: Merged BOL data
+        Merged BOL data with best quality fields
     """
     merged_data = []
     
     def resolve_conflict(values):
-        """Helper function to resolve conflicting values"""
+        """Resolve conflicting values"""
         values_counter = Counter(values)
         return "null" if values_counter["null"] > values_counter["empty"] else "empty"
-
-    # Group BOLs by bill number
+    
+    # Group by bill number
     grouped = {}
     for bol in data:
         bill_no = bol["bill_of_lading"]["bill_no"]
         if bill_no not in grouped:
             grouped[bill_no] = []
         grouped[bill_no].append(bol)
-
-    # Merge data for each bill number
+    
+    # Merge each group
     for bill_no, bol_list in grouped.items():
-        merged = copy.deepcopy(bol_list[0])
+        if len(bol_list) == 1:
+            merged_data.append(bol_list[0])
+            logger.info(f"Single BOL page for bill {bill_no}")
+            continue
+        
+        # Score and sort pages
+        scored_bols = [(bol, calculate_data_quality_score(bol)) for bol in bol_list]
+        scored_bols.sort(key=lambda x: x[1], reverse=True)
+        
+        logger.info(f"\n🔍 BOL MERGE QUALITY SCORES for {bill_no}:")
+        for idx, (bol, score) in enumerate(scored_bols):
+            logger.info(
+                f"  Page {idx}: Score={score}, pod_date={bol['stamp'].get('pod_date')}, "
+                f"total_received={bol['stamp'].get('total_received')}"
+            )
+        
+        # Use highest quality BOL as base
+        best_bol = scored_bols[0][0]
+        merged = copy.deepcopy(best_bol)
+        logger.info(f"✅ Using page with score {scored_bols[0][1]} as base for {bill_no}")
+        
+        # Merge better values from other pages
         for key in merged["stamp"].keys():
             values = [bol["stamp"][key] for bol in bol_list]
+            
             if all(value == values[0] for value in values):
-                merged["stamp"][key] = values[0]
+                continue
+            
+            non_null_values = [
+                bol["stamp"][key] for bol in bol_list 
+                if bol["stamp"][key] not in ["null", "empty", "", None]
+            ]
+            
+            if non_null_values:
+                if key == "pod_date":
+                    # Prefer longer/more complete dates
+                    sorted_dates = sorted(non_null_values, key=lambda x: len(str(x)), reverse=True)
+                    merged["stamp"][key] = sorted_dates[0]
+                    if len(non_null_values) > 1:
+                        logger.info(f"  Merged {key}: chose '{sorted_dates[0]}' over {non_null_values[1:]}")
+                
+                elif key in ["total_received", "damage", "short", "over", "refused"]:
+                    # Prefer non-zero values
+                    numeric_values = [v for v in non_null_values if v != 0]
+                    merged["stamp"][key] = numeric_values[0] if numeric_values else non_null_values[0]
             else:
-                non_null_or_empty = [v for v in values if v not in ["null", "empty"]]
-                merged["stamp"][key] = (
-                    non_null_or_empty[0] if non_null_or_empty 
-                    else resolve_conflict(values)
-                )
+                merged["stamp"][key] = resolve_conflict(values)
+        
         merged_data.append(merged)
-
+        logger.info(
+            f"✅ Final merged data for {bill_no}: pod_date={merged['stamp']['pod_date']}, "
+            f"total_received={merged['stamp']['total_received']}\n"
+        )
+    
     return merged_data
 
-async def bol_stamp_exist(image):
+
+# ============================================================================
+# OCR PROCESSING
+# ============================================================================
+
+@traceable(run_type="llm", name="OCR-Batch", dangerously_allow_filesystem=True)
+async def batch_ocr(
+    ocr_batches: List[models.OCRBatch], 
+    port: Optional[int] = None
+) -> List[models.OCRBatchResponse]:
     """
-    Detect if a stamp exists in the BOL image
-    Args:
-        image: Base64 encoded image
-    Returns:
-        str: 'yes' or 'no' indicating stamp presence
-    """
-    class_names = {0: "no", 1: "yes"}
-    results = stamp_detector.predict(base64topil(image), conf=0.95)
+    Process multiple OCR requests as a batch
     
-    for result in results:
-        classes = result.boxes.cls.tolist()
-        if classes:
-            return class_names[result.boxes.cls.tolist()[0]]
-
-async def batch_list(data, batch_size):
-    """
-    Split data into batches of specified size
     Args:
-        data: List to be batched
-        batch_size: Size of each batch
+        ocr_batches: List of OCR batch requests
+        port: Optional OCR service port
+    
     Returns:
-        list: List of batches
+        List of OCR batch responses
     """
-    return [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+    global OCR_PORT
+    url = f"http://localhost:{port or OCR_PORT}/batch-pixtral-inference"
+    
+    pixtral_requests = []
+    metadata_list = []
+    
+    for ocr_batch in ocr_batches:
+        # Remove data URL prefix if present
+        image_data = ocr_batch.image.split(",")[1] if "," in ocr_batch.image else ocr_batch.image
+        
+        pixtral_requests.append(models.InterVL2Request(
+            image_url_or_path_or_base64=image_data,
+            prompt=ocr_batch.prompt
+        ))
+        
+        metadata_list.append({
+            "page_type": ocr_batch.page_type,
+            "region_name": ocr_batch.region_name,
+            "stamp_exist": ocr_batch.stamp_exist
+        })
+    
+    if not pixtral_requests:
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.post(url, json=[req.model_dump() for req in pixtral_requests])
+            response.raise_for_status()
+        
+        pixtral_batch_responses = [models.InterVL2Response(**item) for item in response.json()]
+        
+        final_ocr_responses = []
+        for i, pixtral_resp in enumerate(pixtral_batch_responses):
+            metadata = metadata_list[i]
+            json_to_parse = pixtral_resp.response
 
-def group_by_page_type(data: List[models.OCRBatchResponse]) -> Dict[str, models.OCRBatchResponse]:
-    """
-    Group OCR responses by page type
-    Args:
-        data: List of OCR batch responses
-    Returns:
-        dict: Responses grouped by page type
-    """
+            # Extract JSON from markdown - enhanced to handle all code block types
+            # Matches ```json, ```java, ```javascript, or plain ``` with optional whitespace
+            pattern = r'```(?:json|java|javascript)?\s*(.*?)\s*```'
+            match = re.search(pattern, json_to_parse, re.DOTALL)
+            if match:
+                json_to_parse = match.group(1).strip()
+            else:
+                # Fallback: strip any remaining code fences
+                json_to_parse = json_to_parse.strip()
+                if json_to_parse.startswith('```'):
+                    # Remove first line if it's a code fence
+                    lines = json_to_parse.split('\n', 1)
+                    if len(lines) > 1:
+                        json_to_parse = lines[1]
+                if json_to_parse.endswith('```'):
+                    json_to_parse = json_to_parse.rsplit('```', 1)[0]
+                json_to_parse = json_to_parse.strip()
+
+            # Clean and parse JSON
+            json_content = json_to_parse.replace("'null'", "null")
+
+            try:
+                parsed_data = json.loads(json_content)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing failed for {metadata['region_name']}: {e}")
+                logger.error(f"Raw response (first 500 chars): {pixtral_resp.response[:500]}")
+                logger.error(f"Cleaned JSON attempt: {json_content[:500]}")
+                # Return empty dict as fallback
+                parsed_data = {}
+            
+            # Validate and clean data
+            validated_data = validate_and_clean_stamp_data(parsed_data, metadata["region_name"])
+            log_extraction_summary(validated_data, metadata["region_name"])
+            
+            final_ocr_responses.append(
+                models.OCRBatchResponse(
+                    page_type=metadata["page_type"],
+                    region_name=metadata["region_name"],
+                    ocr_response=validated_data,
+                    stamp_exist=metadata["stamp_exist"]
+                )
+            )
+        
+        return final_ocr_responses
+    
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error during batch OCR: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Batch OCR service error: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Network error during batch OCR: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Batch OCR service unreachable: {e}"
+        )
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid JSON response from batch OCR service: {e}"
+        )
+    except Exception as e:
+        logger.exception("Unexpected error in batch_ocr")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+def group_by_page_type(data: List[models.OCRBatchResponse]) -> Dict[str, List[models.OCRBatchResponse]]:
+    """Group OCR responses by page type"""
     grouped_data = defaultdict(list)
     for item in data:
         grouped_data[item.page_type].append(item)
     return dict(grouped_data)
 
-def get_yesterday_date():
+
+async def batch_list(data: List, batch_size: int) -> List[List]:
+    """Split data into batches"""
+    return [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+
+
+# ============================================================================
+# POST-PROCESSING FUNCTIONS
+# ============================================================================
+
+def initialize_pod_fields() -> dict:
+    """Initialize POD fields with default values"""
+    return {
+        "B/L Number": "null",
+        "Stamp Exists": "null",
+        "Seal Intact": "null",
+        "POD Date": "null",
+        "Signature Exists": "null",
+        "Issued Qty": "null",
+        "Received Qty": "null",
+        "Damage Qty": "null",
+        "Short Qty": "null",
+        "Over Qty": "null",
+        "Refused Qty": "null",
+        "Customer Order Num": "null",
+    }
+
+
+def process_quantities(
+    bol_data: dict, 
+    stamp_total_received: int, 
+    stamp_total_received_str: str, 
+    customer_order_qty: int,
+    POD_FIELDS: dict,
+    customer_order_num: str,
+) -> dict:
     """
-    Get yesterday's date in MM/DD/YY format
+    Process quantity fields based on stamp and order data
+    
+    Args:
+        bol_data: BOL data dictionary
+        stamp_total_received: Total received as integer
+        stamp_total_received_str: Total received as string
+        customer_order_qty: Customer order quantity
+        POD_FIELDS: POD fields dictionary to update
+    
     Returns:
-        str: Formatted date string
+        Updated POD_FIELDS
     """
-    yesterday = datetime.now() - timedelta(days=1)
-    return f"{yesterday.month:02d}/{yesterday.day:02d}/{yesterday.year % 100:02d}"
+    is_notation = bol_data["stamp"].get("notation_exist") in ["yes", True, "True"]
+    not_stamp_exist = bol_data["stamp"]["stamp_exist"] != "yes"
+    not_receipt = customer_order_num == "null"
+
+    logger.info(f"\n✅ customer_order_num: {customer_order_num}\n")
+
+    # ========== CHANGE 1: NOTATION CASE HANDLING - MOVED TO TOP ==========
+    # When notation exists, return specific values immediately
+    if is_notation and not_stamp_exist and not_receipt:
+        logger.info("✅ NOTATION CASE DETECTED - Applying special logic")
+        
+        # Received qty: check if has value
+        if stamp_total_received_str not in ["null", "empty", "0"]:
+            POD_FIELDS["Received Qty"] = stamp_total_received
+        else:
+            POD_FIELDS["Received Qty"] = "empty"
+        
+        # Damage: check if has value, else "empty"
+        damage_value = bol_data["stamp"].get("damage")
+        if damage_value not in ["null", "empty", "", None, 0]:
+            POD_FIELDS["Damage Qty"] = safe_int_conversion(damage_value, 0)
+        else:
+            POD_FIELDS["Damage Qty"] = "empty"
+        
+        # Short: check if has value, else "empty"
+        short_value = bol_data["stamp"].get("short")
+        if short_value not in ["null", "empty", "", None, 0]:
+            POD_FIELDS["Short Qty"] = safe_int_conversion(short_value, 0)
+        else:
+            POD_FIELDS["Short Qty"] = "empty"
+        
+        # Over: check if has value, else "empty"
+        over_value = bol_data["stamp"].get("over")
+        if over_value not in ["null", "empty", "", None, 0]:
+            POD_FIELDS["Over Qty"] = safe_int_conversion(over_value, 0)
+        else:
+            POD_FIELDS["Over Qty"] = "empty"
+        
+        # Refused: ALWAYS "null" (label not present)
+        POD_FIELDS["Refused Qty"] = "null"
+        
+        return POD_FIELDS
+    # ========== END OF CHANGE 1 ==========
+
+    # Normal case (not notation)
+    if stamp_total_received_str not in ["null", "empty", "0"]:
+        if customer_order_qty == stamp_total_received:
+            # All quantities match
+            POD_FIELDS["Refused Qty"] = 0
+            POD_FIELDS["Short Qty"] = 0
+            POD_FIELDS["Damage Qty"] = 0
+            POD_FIELDS["Over Qty"] = 0
+            POD_FIELDS["Received Qty"] = stamp_total_received
+        else:
+            # Has discrepancies - using safe dictionary access
+            POD_FIELDS["Refused Qty"] = safe_int_conversion(bol_data["stamp"].get("refused", 0), 0)
+            POD_FIELDS["Short Qty"] = safe_int_conversion(bol_data["stamp"].get("short", 0), 0)
+            POD_FIELDS["Damage Qty"] = safe_int_conversion(bol_data["stamp"].get("damage", 0), 0)
+            POD_FIELDS["Over Qty"] = safe_int_conversion(bol_data["stamp"].get("over", 0), 0)
+            POD_FIELDS["Received Qty"] = stamp_total_received
+    else:
+        # No total received - using safe dictionary access
+        POD_FIELDS["Refused Qty"] = safe_int_conversion(bol_data["stamp"].get("refused", 0), 0)
+        POD_FIELDS["Short Qty"] = safe_int_conversion(bol_data["stamp"].get("short", 0), 0)
+        POD_FIELDS["Damage Qty"] = safe_int_conversion(bol_data["stamp"].get("damage", 0), 0)
+        POD_FIELDS["Over Qty"] = safe_int_conversion(bol_data["stamp"].get("over", 0), 0)
+        POD_FIELDS["Received Qty"] = safe_str_conversion(bol_data["stamp"].get("total_received", "null"), "null")
+    
+    return POD_FIELDS
+
+def validate_received_qty(POD_FIELDS: dict, bol_data: dict) -> dict:
+    """
+    Validate and correct received quantity fields
+    
+    Args:
+        POD_FIELDS: POD fields dictionary
+        bol_data: BOL data dictionary
+    
+    Returns:
+        Updated POD_FIELDS
+    """
+    received_qty = str(POD_FIELDS['Received Qty']).lower()
+    issued_qty = str(POD_FIELDS['Issued Qty']).lower()
+    is_notation = bol_data["stamp"].get("notation_exist") in ["yes", True, "True"]
+    
+    if (
+        received_qty in ["null", "empty", "", "n/a", "0"]
+        and issued_qty not in ["null", "empty", "", "n/a", "0"]
+        and not is_notation
+    ):
+        if bol_data["stamp"]["stamp_exist"] == "yes" or bol_data["stamp"]["notation_exist"] == "yes":
+            stamp_total_received = bol_data["stamp"].get("total_received", "null")
+            
+            if stamp_total_received in ["null", "empty", "", "N/A", 0]:
+                POD_FIELDS['Received Qty'] = "null"
+                POD_FIELDS['Damage Qty'] = "null"
+                POD_FIELDS['Short Qty'] = "null"
+                POD_FIELDS['Over Qty'] = "null"
+                POD_FIELDS['Refused Qty'] = "null"
+                POD_FIELDS["Status"] = "incomplete_data"
+            else:
+                POD_FIELDS['Received Qty'] = "null"
+                POD_FIELDS['Damage Qty'] = 0
+                POD_FIELDS['Short Qty'] = 0
+                POD_FIELDS['Over Qty'] = 0
+                POD_FIELDS['Refused Qty'] = 0
+                POD_FIELDS["Status"] = "valid"
+        else:
+            # Invalid stamp
+            POD_FIELDS['Received Qty'] = "null"
+            POD_FIELDS['Damage Qty'] = "null"
+            POD_FIELDS['Short Qty'] = "null"
+            POD_FIELDS['Over Qty'] = "null"
+            POD_FIELDS['Refused Qty'] = "null"
+            POD_FIELDS["POD Date"] = "null"
+            POD_FIELDS["Signature Exists"] = "null"
+            POD_FIELDS["Stamp Exists"] = "null"
+            POD_FIELDS["Status"] = "invalid"
+    else:
+        POD_FIELDS["Status"] = "valid"
+    
+    return POD_FIELDS
+
+
+# ============================================================================
+# MAIN OCR PROCESSING
+# ============================================================================
 
 @traceable(run_type="chain", name="run-ocr", dangerously_allow_filesystem=True)
-async def run_ocr(file_url_or_path: str, batch_size=4, port=None) -> List[models.OCRResponse]:
-    # Initialize ML Models
-   
-    
+async def run_ocr(
+    file_url_or_path: str,
+    batch_size: int = 4,
+    port: Optional[int] = None
+) -> List[models.OCRResponse]:
+    """
+    Main OCR processing pipeline
+
+    Args:
+        file_url_or_path: File path or URL
+        batch_size: Batch size for processing
+        port: Optional OCR service port
+
+    Returns:
+        List of POD fields
+    """
+    # File size limits
+    MAX_FILE_SIZE_MB = 50
+    MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+    MAX_PDF_PAGES = 100
+
     try:
-        print(f"start of process: {datetime.now()}")
+        logger.info(f"\n🚀 STARTING OCR PROCESSING\nFile: {file_url_or_path}\n")
+
+        # Load document
         if os.path.isfile(str(file_url_or_path)):
+            # Validate file size
+            file_size = os.path.getsize(file_url_or_path)
+            if file_size > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large: {file_size / 1024 / 1024:.2f}MB. Maximum allowed: {MAX_FILE_SIZE_MB}MB"
+                )
+
+            logger.info(f"Processing local file: {file_url_or_path} ({file_size / 1024 / 1024:.2f}MB)")
+
             ext = os.path.splitext(file_url_or_path)[1].lower()
+
             if ext == ".pdf":
-                pages =await pdf_to_images(file_url_or_path)
+                pages = await pdf_to_images(file_url_or_path, max_pages=MAX_PDF_PAGES)
             elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]:
                 with Image.open(file_url_or_path) as img:
                     with BytesIO() as output:
                         img.convert("RGB").save(output, format="JPEG")
                         output.seek(0)
-                        img_jpg = Image.open(output).copy()
-                pages = [img_jpg]
+                        pages = [Image.open(output).copy()]
             else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type: {ext}"
-                )
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
         else:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(file_url_or_path)
-            # response = requests.get(file_url_or_path)
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to fetch the file from URL: {file_url_or_path}",
+            # Fetch from URL with streaming and size limits
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=300.0,  # 5 minutes for large files
+                    write=60.0,
+                    pool=10.0
                 )
+            ) as client:
+                # Stream download with size validation
+                async with client.stream('GET', file_url_or_path) as response:
+                    if response.status_code != 200:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Failed to fetch file from URL: {file_url_or_path} (HTTP {response.status_code})"
+                        )
+
+                    # Check Content-Length header
+                    content_length = response.headers.get('content-length')
+                    if content_length:
+                        size_mb = int(content_length) / 1024 / 1024
+                        if int(content_length) > MAX_FILE_SIZE_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"File too large: {size_mb:.2f}MB. Maximum allowed: {MAX_FILE_SIZE_MB}MB"
+                            )
+                        logger.info(f"Downloading file from URL: {file_url_or_path} ({size_mb:.2f}MB)")
+
+                    # Stream download with size limit enforcement
+                    chunks = []
+                    total_size = 0
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):  # 64KB chunks
+                        chunks.append(chunk)
+                        total_size += len(chunk)
+                        if total_size > MAX_FILE_SIZE_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"File exceeded {MAX_FILE_SIZE_MB}MB during download"
+                            )
+
+                    content = b''.join(chunks)
+                    logger.info(f"Downloaded {total_size / 1024 / 1024:.2f}MB from URL")
+
             content_type = response.headers.get("Content-Type", "").lower()
+
             if "pdf" in content_type:
-                pages =await pdf_to_images(response.content)
-            elif any(img_fmt in content_type for img_fmt in ["jpeg", "png", "bmp", "tiff", "webp"]):
-                img = Image.open(BytesIO(response.content))
+                pages = await pdf_to_images(content, max_pages=MAX_PDF_PAGES)
+            elif any(fmt in content_type for fmt in ["jpeg", "png", "bmp", "tiff", "webp"]):
+                img = Image.open(BytesIO(content))
                 with BytesIO() as output:
                     img.convert("RGB").save(output, format="JPEG")
                     output.seek(0)
-                    img_jpg = Image.open(output).copy()
-                pages = [img_jpg]
+                    pages = [Image.open(output).copy()]
             else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported content type in URL."
-                )
-        print(f"start of overall_classified pages: {datetime.now()}")
-
-
-        classified_pages = classify_documents(
-            [convert_image_to_base64(page) for page in pages]
-        )
-        print(f"End of overall_classified pages: {datetime.now()}")
-
+                raise HTTPException(status_code=400, detail="Unsupported content type in URL")
         
+        # Classify documents
+        logger.info("\n📄 DOCUMENT CLASSIFICATION START\n")
+        classified_pages = classify_documents([convert_image_to_base64(page) for page in pages])
+        logger.info(
+            f"\n📄 CLASSIFICATION COMPLETE\n"
+            f"Pages: {len(classified_pages)}\n"
+            f"Types: {list(classified_pages.keys())}\n"
+        )
+        
+        # Prepare OCR requests
         ocr_output_pdf = defaultdict(list)
         all_requests = []
+        
         for cls, cls_pages in classified_pages.items():
             if cls == "BOL":
                 for page_idx, page in enumerate(cls_pages):
-                    straighten_result =await straighten_img(page)
-                    page =straighten_result["img"]
-                    stamp_exist =await bol_stamp_exist(page)
+                    # Straighten image
+                    straighten_result = await straighten_img(page)
+                    page = straighten_result["img"]
+                    
+                    # Detect stamp
+                    stamp_exist = await bol_stamp_exist(page)
+                    
+                    # Detect regions
                     bill_of_ladings_regions = bol_detect_regions(page).model_dump()
-                    ocr_output_image = {}
-                    #_____________________________________________________________________________________________________________________________________________________FIX-NEEDED-21
+                    logger.info(
+                        f"\n🎯 BOL REGIONS\n"
+                        f"Page: {page_idx}\n"
+                        f"Regions: {list(bill_of_ladings_regions.keys())}\n"
+                        f"Stamp: {stamp_exist}\n"
+                    )
+                    
                     if bill_of_ladings_regions:
                         for region_name, image_base64 in bill_of_ladings_regions.items():
-                            region: BaseModel = region2model[region_name]
+                            region: BaseModel = REGION_TO_MODEL[region_name]
+                            
                             if not image_base64:
+                                logger.warning(f"⚠️ Missing {region_name}, using full page")
                                 image_base64 = page
-                            print("Region Name: ", region_name)
-                            prompt = region2prompt[region_name]
-                            OCR_PORT = 3203     
+                            
+                            prompt = REGION_TO_PROMPT[region_name]
+                            
                             all_requests.append(
                                 models.OCRBatch(
-                                    **{
-                                        "page_type": f"BOL_{page_idx}",
-                                        "region_name": region_name,
-                                        "prompt": prompt,
-                                        "image": image_base64,
-                                        "stamp_exist": stamp_exist,
-                                    }
+                                    page_type=f"BOL_{page_idx}",
+                                    region_name=region_name,
+                                    prompt=prompt,
+                                    image=image_base64,
+                                    stamp_exist=stamp_exist,
                                 )
                             )
-            if cls == "receipt":
-                receipt_page= await straighten_img(cls_pages[0])
+                    else:
+                        # Fallback to heuristic stamp crop
+                        logger.warning("⚠️ No BOL regions detected, using heuristic fallback")
+                        fallback_stamp = heuristic_stamp_crop_base64(page)
+                        
+                        if fallback_stamp:
+                            all_requests.append(
+                                models.OCRBatch(
+                                    page_type=f"BOL_{page_idx}",
+                                    region_name="stamp",
+                                    prompt=REGION_TO_PROMPT["stamp"],
+                                    image=fallback_stamp,
+                                    stamp_exist=stamp_exist,
+                                )
+                            )
+            
+            elif cls == "receipt":
+                # Straighten receipt
+                receipt_page = await straighten_img(cls_pages[0])
                 receipt_page = receipt_page["img"]
+                
+                # Detect regions
                 receipt_regions = receipt_detect_regions(receipt_page).model_dump()
-                ocr_output_image = {}
+                logger.info(f"\n🎯 RECEIPT REGIONS\nRegions: {list(receipt_regions.keys())}\n")
+                
                 if receipt_regions:
                     for region_name, image_base64 in receipt_regions.items():
                         if not image_base64:
-                            print("no image>>>>>>>>>>>>>>>>>>>>>")
+                            logger.warning(f"⚠️ Missing {region_name}, using full page")
                             image_base64 = receipt_page
-                        print(">>>>>>>>>>>>>>>>>", region_name)
-                        prompt = region2prompt[region_name]
+                        
+                        prompt = REGION_TO_PROMPT[region_name]
+                        
                         all_requests.append(
                             models.OCRBatch(
-                                **{
-                                    "page_type": "receipt",
-                                    "region_name": region_name,
-                                    "prompt": prompt,
-                                    "image": image_base64,
-                                }
+                                page_type="receipt",
+                                region_name=region_name,
+                                prompt=prompt,
+                                image=image_base64,
                             )
                         )
-        print(f"start of batch_list: {datetime.now()}")
-
+                else:
+                    # Fallback to critical regions
+                    logger.warning("⚠️ No receipt regions detected, using critical regions fallback")
+                    critical_regions = ["pod_date", "pod_sign", "total_received"]
+                    
+                    for region_name in critical_regions:
+                        prompt = REGION_TO_PROMPT[region_name]
+                        all_requests.append(
+                            models.OCRBatch(
+                                page_type="receipt",
+                                region_name=region_name,
+                                prompt=prompt,
+                                image=receipt_page,
+                            )
+                        )
         
-        # batches =await batch_list(all_requests, batch_size)
-        # print(f"End of batch_list: {datetime.now()}")
-
-        # batch_responses = []
-        # for batch in batches:
-        #     print(f"start of batch: {datetime.now()}")
-
-        #     # This line now calls the modified batch_ocr for true batch inference
-        #     batch_ocr_result=await batch_ocr(batch) 
-        #     batch_responses.extend(batch_ocr_result)
-        #     print(f"End of batch: {datetime.now()}")
-
-
-
+        logger.info(f"\n🔍 REGION DETECTION COMPLETE\nTotal requests: {len(all_requests)}\n")
         
-        # batches =await batch_list(all_requests, batch_size)
-        print(f"End of batch_list: {datetime.now()}")
-
-        # batch_responses = []
-        # for batch in batches:
-        print(f"start of batch: {datetime.now()}")
-
-            # This line now calls the modified batch_ocr for true batch inference
-        batch_responses=await batch_ocr(all_requests) 
-            # batch_responses.extend(batch_ocr_result)
-        print(f"End of batch: {datetime.now()}")
-
-
+        # Process OCR
+        logger.info(f"\n🤖 VLM OCR START\nBatch size: {len(all_requests)}\n")
+        batch_responses = await batch_ocr(all_requests)
+        logger.info(f"\n🤖 VLM OCR COMPLETE\nResponses: {len(batch_responses)}\n")
         
-            
+        # Group responses
+        grouped_batch_responses = group_by_page_type(batch_responses)
+        logger.info(f"\n⚙️ POST-PROCESSING START\nGroups: {list(grouped_batch_responses.keys())}\n")
         
-        grouped_batch_responses: Dict[str, List[models.OCRBatchResponse]] = group_by_page_type(batch_responses)
-        print(">>>>>>>>>>>>", grouped_batch_responses)
-        print(f"start of post_process: {datetime.now()}")
-
+        # Process responses
         for page_type, responses in grouped_batch_responses.items():
             ocr_output_image = {}
-            #__________________________________________________________________________________________________________________________________________________________FIX-20
+            
             if "BOL" in page_type:
                 for response in responses:
-                    region: BaseModel = region2model[response.region_name]
+                    logger.info(
+                        f"\n📊 OCR RESPONSE\n"
+                        f"Region: {response.region_name}\n"
+                        f"Page: {response.page_type}\n"
+                    )
+                    
+                    # Normalize stamp data
+                    if response.region_name == "stamp":
+                        stamp_field_types = {
+                            "damage": int,
+                            "short": int,
+                            "refused": int,
+                            "over": int,
+                            "total_received": int,
+                            "stamp_exist": str,
+                            "notation_exist": str,
+                            "pod_sign": str,
+                            "pod_date": str,
+                            "seal_intact": str
+                        }
+                        response.ocr_response = normalize_ocr_data(
+                            response.ocr_response, 
+                            stamp_field_types
+                        )
+                        logger.info(f"✅ Stamp data normalized")
+                    
+                    elif response.region_name == "customer_order_info":
+                        customer_order_field_types = {"total_order_quantity": int}
+                        response.ocr_response = normalize_ocr_data(
+                            response.ocr_response, 
+                            customer_order_field_types
+                        )
+                        logger.info(f"✅ Customer order data normalized")
+                    
+                    # Parse response
+                    region: BaseModel = REGION_TO_MODEL[response.region_name]
                     response_parsed = region(**response.ocr_response)
+                    logger.info(f"✅ === response.region_name, {response.region_name}")
                     if response.region_name == "stamp":
                         response_parsed.stamp_exist = response.stamp_exist
                         response_parsed.seal_intact = response.ocr_response.get("seal_intact", "null")
-                    if response.region_name == "stamp" and response_parsed.total_received not in ["empty", "null", "", "N/A"]:
-                        if isinstance(response_parsed.total_received, str):
-                            total_rec = re.findall(r"-?\d+", response_parsed.total_received)
-                            if isinstance(total_rec, list) and len(total_rec) > 1:
-                                response_parsed.total_received = int(total_rec[0])
-                    # FIX: Add signature fallback logic - if stamp pod_sign is null/empty, try signatures region
-                    if (response.region_name == "stamp" and 
-                        response.ocr_response.get("pod_sign") in ["null", "empty", "", None] and
-                        "signatures" in ocr_output_image and ocr_output_image["signatures"].get("receiver_signature")):
-                        response_parsed.pod_sign = ocr_output_image["signatures"]["receiver_signature"]
-                        print(f"Using signatures region fallback for stamp: {response_parsed.pod_sign}")
+                        
+                        # Parse total_received if string with numbers
+                        if response_parsed.total_received not in ["empty", "null", "", "N/A"]:
+                            if isinstance(response_parsed.total_received, str):
+                                total_rec = re.findall(r"-?\d+", response_parsed.total_received)
+                                if isinstance(total_rec, list) and len(total_rec) > 1:
+                                    response_parsed.total_received = safe_int_conversion(total_rec[0], "null")
+                        
+                        # Signature fallback
+                        if (response.ocr_response.get("pod_sign") in ["null", "empty", "", None] and
+                            "signatures" in ocr_output_image and 
+                            ocr_output_image["signatures"].get("receiver_signature")):
+                            response_parsed.pod_sign = ocr_output_image["signatures"]["receiver_signature"]
+                            logger.info("Using signatures region fallback")
+                    
                     ocr_output_image.update({response.region_name: response_parsed})
+                logger.info(f"✅ === before any message :)")
                 try:
+                    logger.info(f"✅ === after any message :)")
                     ocr_output_pdf["BOL"].append(
                         models.OCRResponse(**ocr_output_image).model_dump()
                     )
                 except Exception as e:
-                    print(f"Validation failed for OCRResponse: {e}")
+                    logger.error(f"Validation failed for OCRResponse: {e}")
                     raise HTTPException(status_code=500, detail=f"Invalid response structure: {e}")
+            
             elif page_type == "receipt":
                 for response in responses:
-                    if (
-                        response.region_name == "total_received"
-                        and response.ocr_response["total_received"] not in ["empty", "null", "N/A", ""]
-                    ):
-                        response.ocr_response["total_received"] = sum(response.ocr_response["total_received"])
-                    elif response.region_name == "damage" and response.ocr_response["damage"] not in ["empty", "null", "N/A", ""]:
-                        response.ocr_response["damage"] = sum(response.ocr_response["damage"])
-                    elif response.region_name == "refused" and response.ocr_response["refused"] not in ["empty", "null", "N/A", ""]:
-                        response.ocr_response["refused"] = sum(response.ocr_response["refused"])
+                    # Normalize receipt data
+                    if response.region_name in ["total_received", "damage", "refused"]:
+                        if isinstance(response.ocr_response.get(response.region_name), list):
+                            items = response.ocr_response[response.region_name]
+                            response.ocr_response[response.region_name] = [
+                                safe_int_conversion(item, 0) for item in items
+                            ]
+                    
+                    # Sum lists - using safe dictionary access to prevent KeyError
+                    if response.region_name == "total_received":
+                        total_received_val = response.ocr_response.get("total_received")
+                        if total_received_val not in ["empty", "null", "N/A", "", None]:
+                            if isinstance(total_received_val, list):
+                                response.ocr_response["total_received"] = sum(total_received_val)
+                    elif response.region_name == "damage":
+                        damage_val = response.ocr_response.get("damage")
+                        if damage_val not in ["empty", "null", "N/A", "", None]:
+                            if isinstance(damage_val, list):
+                                response.ocr_response["damage"] = sum(damage_val)
+                    elif response.region_name == "refused":
+                        refused_val = response.ocr_response.get("refused")
+                        if refused_val not in ["empty", "null", "N/A", "", None]:
+                            if isinstance(refused_val, list):
+                                response.ocr_response["refused"] = sum(refused_val)
+                    
                     ocr_output_image.update(response.ocr_response)
+                
                 try:
                     ocr_output_pdf["receipt"].append(
                         models.DeliveryReceipt(**ocr_output_image).model_dump()
                     )
                 except Exception as e:
-                    print(f"Validation failed for OCRResponse: {e}")
+                    logger.error(f"Validation failed for DeliveryReceipt: {e}")
                     raise HTTPException(status_code=500, detail=f"Invalid response structure: {e}")
         
-        # Merge bol pages data
+        # Merge BOL data
         ocr_output_pdf["BOL"] = merge_bol_data(ocr_output_pdf["BOL"])
-
-        print(">>>>>>>>>>>>", ocr_output_pdf)
-        POD_FIELDS = {
-            "B/L Number": "null",
-            "Stamp Exists": "null",
-            "Seal Intact": "null",
-            "POD Date": "null",
-            "Signature Exists": "null",
-            "Issued Qty": "null",
-            "Received Qty": "null",
-            "Damage Qty": "null",
-            "Short Qty": "null",
-            "Over Qty": "null",
-            "Refused Qty": "null",
-            "Customer Order Num": "null",
-        }
-
-        # Process the aggregated OCR results to produce final POD_FIELDS output.
-        # If both receipt and BOL data exist, extract the date from bill_of_lading,
-        # parse it as MM-DD-YYYY, and adjust using adjust_date from utils.
-        if len(ocr_output_pdf["receipt"]) == 1:
+        
+        logger.info("\n⚙️ POST-PROCESSING COMPLETE\n")
+        
+        # Generate POD fields
+        POD_FIELDS = initialize_pod_fields()
+        POD_FIELDS_LIST = []
+        
+        # Case 1: Receipt + single BOL
+        if len(ocr_output_pdf.get("receipt", [])) == 1 and len(ocr_output_pdf.get("BOL", [])) == 1:
             delivery_receipt_data = ocr_output_pdf["receipt"][0]
             bol_data = ocr_output_pdf["BOL"][0]
             
-            # If there's a delivery receipt, use its complete date
             POD_FIELDS["POD Date"] = preprocess_date(delivery_receipt_data["pod_date"])
+            POD_FIELDS["Signature Exists"] = delivery_receipt_data["pod_sign"]
+            POD_FIELDS["Customer Order Num"] = process_customer_numbers(
+                delivery_receipt_data["customer_order_num"]
+            )
+            POD_FIELDS["Issued Qty"] = safe_int_conversion(
+                bol_data["customer_order_info"]["total_order_quantity"], 0
+            )
+            POD_FIELDS["B/L Number"] = bol_data["bill_of_lading"]["bill_no"]
+            POD_FIELDS["Stamp Exists"] = bol_data["stamp"]["stamp_exist"]
+            POD_FIELDS["Received Qty"] = safe_int_conversion(delivery_receipt_data["total_received"], "null")
             
-            # Add new condition for POD Date when stamp is invalid, no receipt, and issue date is null
+            # Handle invalid stamp + no receipt + null issue date
             if (bol_data["stamp"]["stamp_exist"] != "yes" and 
-                len(ocr_output_pdf.get("receipt", [])) == 0 and 
                 bol_data["bill_of_lading"].get("date", "null") in ["null", "empty", "", None]):
-                
                 yesterday = datetime.now() - timedelta(days=1)
                 POD_FIELDS["POD Date"] = f"{yesterday.month:02d}/{yesterday.day:02d}/{yesterday.year % 100:02d}"
             
-            POD_FIELDS["Signature Exists"] = delivery_receipt_data["pod_sign"]
-            POD_FIELDS["Customer Order Num"] = process_customer_numbers(delivery_receipt_data["customer_order_num"])
-            POD_FIELDS["Issued Qty"] = bol_data["customer_order_info"]["total_order_quantity"]
-            POD_FIELDS["B/L Number"] = bol_data["bill_of_lading"]["bill_no"]
-            POD_FIELDS["Stamp Exists"] = bol_data["stamp"]["stamp_exist"]
-        
-            if delivery_receipt_data["total_received"] not in ["null", "empty", "0"] and POD_FIELDS["Issued Qty"] not in ["null", "empty", "N/A", "", "-", "0"]:
-                POD_FIELDS["Received Qty"] = int(delivery_receipt_data["total_received"])
-                if int(POD_FIELDS["Issued Qty"]) == POD_FIELDS["Received Qty"]:
-                    (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = 0, 0, 0, 0
-                else:
-                    (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = (
-                        bol_data["stamp"]["refused"],
-                        bol_data["stamp"]["short"],
-                        bol_data["stamp"]["damage"],
-                        bol_data["stamp"]["over"],
-                    )
-            else:
-                # Add fallback logic for 'Received Qty' when it's invalid or missing in the receipt
-                received_qty = str(delivery_receipt_data["total_received"]).lower()
-                issued_qty = str(POD_FIELDS["Issued Qty"]).lower()
-
-                if received_qty in ["null", "empty", "", "n/a", "0"] and issued_qty not in ["null", "empty", "", "n/a", "0"]:
-                    if bol_data["stamp"]["stamp_exist"] == "yes":
-                        # Check if total_received field exists and has a value in the stamp
-                        stamp_total_received = bol_data["stamp"].get("total_received", "null")
-                        
-                        if stamp_total_received in ["null", "empty", "", "N/A"]:
-                            # total_received is not present on stamp - keep as null
-                            POD_FIELDS['Received Qty'] = "null"
-                            POD_FIELDS['Damage Qty'] = "null"
-                            POD_FIELDS['Short Qty'] = "null"
-                            POD_FIELDS['Over Qty'] = "null"
-                            POD_FIELDS['Refused Qty'] = "null"
-                            POD_FIELDS["Status"] = "incomplete_data"
-                        else:
-                            # total_received is present on stamp but invalid in receipt - assume full delivery
-                            POD_FIELDS['Received Qty'] = int(POD_FIELDS['Issued Qty'])
-                            POD_FIELDS['Damage Qty'] = 0
-                            POD_FIELDS['Short Qty'] = 0
-                            POD_FIELDS['Over Qty'] = 0
-                            POD_FIELDS['Refused Qty'] = 0
-                            POD_FIELDS["Status"] = "valid"
-                    else:
-                        # Existing logic for invalid stamp
-                        POD_FIELDS['Received Qty'] = "null"
-                        POD_FIELDS['Damage Qty'] = "null"
-                        POD_FIELDS['Short Qty'] = "null"
-                        POD_FIELDS['Over Qty'] = "null"
-                        POD_FIELDS['Refused Qty'] = "null"
-                        POD_FIELDS["POD Date"] = "null"
-                        POD_FIELDS["Signature Exists"] = "null"
-                        POD_FIELDS["Stamp Exists"] = "null"
-                        POD_FIELDS["Status"] = "invalid"
-                        
-                else:
-                    # Fallback to BOL stamp if available
-                    if (bol_data["stamp"]["total_received"] not in ["null", "empty"]
-                        and bol_data["customer_order_info"]["total_order_quantity"] not in ["null", "empty", "N/A", "", "-", "0"]):
-                        if int(bol_data["customer_order_info"]["total_order_quantity"]) == int(bol_data["stamp"]["total_received"]):
-                            POD_FIELDS["Received Qty"] = int(bol_data["stamp"]["total_received"])
-                            POD_FIELDS["Damage Qty"] = 0
-                            POD_FIELDS["Short Qty"] = 0
-                            POD_FIELDS["Over Qty"] = 0
-                            POD_FIELDS["Refused Qty"] = 0
-                            POD_FIELDS["Status"] = "valid" 
-                        else:
-                            POD_FIELDS["Received Qty"] = int(bol_data["stamp"]["total_received"])
-                            (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = (
-                                bol_data["stamp"]["refused"],
-                                bol_data["stamp"]["short"],
-                                bol_data["stamp"]["damage"],
-                                bol_data["stamp"]["over"],
-                            )
-                            POD_FIELDS["Status"] = "valid" 
-                    else:
-                        POD_FIELDS["Received Qty"] = "null"
-                        POD_FIELDS["Status"] = "invalid"
-                        
-            POD_FIELDS_LIST = [POD_FIELDS]
-        elif len(ocr_output_pdf["BOL"]) > 1 and len(ocr_output_pdf["receipt"]) == 1:
-                    POD_FIELDS["Status"] = "failed"
-                    POD_FIELDS_LIST = [POD_FIELDS]
-        else:
-            POD_FIELDS_LIST = []
-            for bol_data in ocr_output_pdf["BOL"]:
-                POD_FIELDS = {
-                    "B/L Number": "null",
-                    "Stamp Exists": "null",
-                    "Seal Intact": "null",
-                    "POD Date": "null",
-                    "Signature Exists": "null",
-                    "Issued Qty": "null",
-                    "Received Qty": "null",
-                    "Damage Qty": "null",
-                    "Short Qty": "null",
-                    "Over Qty": "null",
-                    "Refused Qty": "null",
-                    "Customer Order Num": "null",
-                }
+            # Process quantities
+            if (delivery_receipt_data["total_received"] not in ["null", "empty", "0", "", None] and 
+                POD_FIELDS["Issued Qty"] not in ["null", "empty", "N/A", "", "-", "0"]):
+                POD_FIELDS["Received Qty"] = safe_int_conversion(POD_FIELDS["Issued Qty"], "null")
                 
-                # Parse bill_of_lading date to get month, day, year
+                issued_qty_int = safe_int_conversion(POD_FIELDS["Issued Qty"], 0)
+                received_qty_int = safe_int_conversion(POD_FIELDS["Issued Qty"], 0)
+                
+                POD_FIELDS["Refused Qty"] = "null"
+                POD_FIELDS["Short Qty"] = "null"
+                POD_FIELDS["Damage Qty"] = "null"
+                POD_FIELDS["Over Qty"] = "null"
+            else:
+                # Validate received quantity
+                POD_FIELDS = validate_received_qty(POD_FIELDS, bol_data)
+            
+            POD_FIELDS_LIST = [POD_FIELDS]
+        
+        # Case 2: Multiple BOLs + receipt
+        elif len(ocr_output_pdf.get("BOL", [])) > 1 and len(ocr_output_pdf.get("receipt", [])) == 1:
+            POD_FIELDS["Status"] = "failed"
+            POD_FIELDS_LIST = [POD_FIELDS]
+        
+        # Case 3: Multiple BOLs without receipt
+        else:
+            for bol_data in ocr_output_pdf.get("BOL", []):
+                POD_FIELDS = initialize_pod_fields()
+                
                 bill_date_str = bol_data["bill_of_lading"].get("date", None)
                 
-                # Add new condition: if stamp invalid, no receipt, and issue date null
-
-                if (bol_data["stamp"]["stamp_exist"] != "yes" and 
-                    len(ocr_output_pdf.get("receipt", [])) == 0 and 
+                # Check for invalid stamp + no receipt + null issue date
+                if ((bol_data["stamp"].get("stamp_exist") != "yes" and 
+                     bol_data["stamp"].get("notation_exist") != "yes") and
+                    len(ocr_output_pdf.get("receipt", [])) == 0 and
                     (bill_date_str is None or bill_date_str in ["null", "empty", ""])):
                     
                     yesterday = datetime.now() - timedelta(days=1)
                     POD_FIELDS["POD Date"] = f"{yesterday.month:02d}/{yesterday.day:02d}/{yesterday.year % 100:02d}"
-                    # Set other required fields
                     POD_FIELDS["B/L Number"] = bol_data["bill_of_lading"]["bill_no"]
-                    POD_FIELDS["Issued Qty"] = bol_data["customer_order_info"]["total_order_quantity"]
+                    POD_FIELDS["Issued Qty"] = safe_int_conversion(
+                        bol_data["customer_order_info"]["total_order_quantity"], 0
+                    )
                     POD_FIELDS["Stamp Exists"] = bol_data["stamp"]["stamp_exist"]
                     POD_FIELDS["Seal Intact"] = bol_data["stamp"]["seal_intact"]
                     POD_FIELDS["Signature Exists"] = bol_data["stamp"]["pod_sign"]
                     
-                    # FIX: Add signature fallback logic - if stamp pod_sign is null/empty, try signatures region
-                    if (bol_data["stamp"]["pod_sign"] in ["null", "empty", "", None] and 
+                    # Signature fallback
+                    if (bol_data["stamp"]["pod_sign"] in ["null", "empty", "", None] and
                         "signatures" in bol_data and bol_data["signatures"].get("receiver_signature")):
                         POD_FIELDS["Signature Exists"] = bol_data["signatures"]["receiver_signature"]
-                        print(f"Using signatures region fallback: {POD_FIELDS['Signature Exists']}")
                     
-                    # Since stamp is invalid, set quantities to null
-                    POD_FIELDS["Received Qty"] = "null"
-                    POD_FIELDS["Damage Qty"] = "null"
-                    POD_FIELDS["Short Qty"] = "null"
-                    POD_FIELDS["Over Qty"] = "null"
-                    POD_FIELDS["Refused Qty"] = "null"
+                    # Set quantities to null
+                    for field in ["Received Qty", "Damage Qty", "Short Qty", "Over Qty", "Refused Qty"]:
+                        POD_FIELDS[field] = "null"
                     POD_FIELDS["POD Date"] = "null"
                     POD_FIELDS["Signature Exists"] = "null"
                     POD_FIELDS["Stamp Exists"] = "null"
-                    
-                    # Set status to invalid
                     POD_FIELDS["Status"] = "invalid"
                     
-                    print(f"Using current date-1 due to invalid stamp, no receipt, and null issue date: {POD_FIELDS['POD Date']}")
-                    
+                    logger.info("Using current date-1 due to invalid stamp + no receipt + null issue date")
                 else:
-                    # Continue with existing date processing logic
-                    # First process the POD date to get its month
-                    pod_date = preprocess_date(bol_data["stamp"]["pod_date"])
-
-                
-                    # First process the POD date to get its month
+                    # Parse dates
                     pod_date = preprocess_date(bol_data["stamp"]["pod_date"])
                     pod_month = None
+                    
                     if pod_date not in ["null", "empty", "Error Processing Date"]:
                         try:
                             pod_parts = pod_date.split('/')
                             if len(pod_parts) >= 2:
-                                pod_month = int(pod_parts[0])
+                                pod_month = safe_int_conversion(pod_parts[0], None)
                         except:
                             pod_month = None
                     
-                    # Handle special case where bill_date is in format "DD/YYYY"
-                    if bill_date_str and "/" in bill_date_str:
-                        parts = bill_date_str.split('/')
-                        if len(parts) == 2 and len(parts[1]) == 4:  # Format is "DD/YYYY"
-                            try:
-                                day = int(parts[0])
-                                year = int(parts[1])
-                                # Use POD month if available, otherwise current month
-                                month = pod_month if pod_month is not None else datetime.now().month
-                                bill_date_str = f"{month}/{day}/{year}"
-                            except ValueError:
-                                bill_date_str = None
-                    
-                    # Convert date format from MM-DD-YYYY to MM/DD/YY
-                    if bill_date_str and "-" in bill_date_str:
-                        try:
-                            bill_date = datetime.strptime(bill_date_str, "%m-%d-%Y")
-                            bill_date_str = bill_date.strftime("%m/%d/%y")
-                        except ValueError:
-                            bill_date_str = None
-                    
-                    processed_bill_date = preprocess_date(bill_date_str) if bill_date_str else "null"
+                    processed_bill_date = preprocess_date(bill_date_str)
                     extracted_year = None
                     month_bill = None
                     day_bill = None
@@ -906,225 +1589,91 @@ async def run_ocr(file_url_or_path: str, batch_size=4, port=None) -> List[models
                         try:
                             parts = processed_bill_date.split('/')
                             if len(parts) >= 2:
-                                # If bill date is missing month (first part is day), use POD month
-                                if pod_month is not None and int(parts[0]) > 12:
+                                first_part = safe_int_conversion(parts[0], 0)
+                                
+                                # Use POD month if bill date is missing month
+                                if pod_month is not None and first_part > 12:
                                     month_bill = pod_month
-                                    day_bill = int(parts[0])
+                                    day_bill = first_part
                                 else:
-                                    month_bill = int(parts[0])
-                                    day_bill = int(parts[1])
+                                    month_bill = first_part
+                                    day_bill = safe_int_conversion(parts[1], 0)
                                 
                                 if len(parts) >= 3:
                                     year_str = parts[2]
-                                    extracted_year = 2000 + int(year_str) if len(year_str) == 2 else int(year_str)
+                                    year_int = safe_int_conversion(year_str, None)
+                                    if year_int is not None:
+                                        extracted_year = 2000 + year_int if len(year_str) == 2 else year_int
+                                    else:
+                                        extracted_year = datetime.now().year
                                 else:
                                     extracted_year = datetime.now().year
                         except Exception as e:
-                            print(f"Error parsing bill_of_lading date: {e}")
-                
-                    # Process POD date from stamp
-                    # Add these debug prints at the very start
-                    print("DEBUG - Initial values:")
-                    print(f"processed_bill_date: {processed_bill_date}")
-                    print(f"month_bill: {month_bill}")
-                    print(f"day_bill: {day_bill}")
-                    print(f"extracted_year: {extracted_year}")
+                            logger.error(f"Error parsing bill_of_lading date: {e}")
                     
-                    # Process POD date from stamp
-                    pod_date = preprocess_date(bol_data["stamp"]["pod_date"])
-                    print(f"Initial POD date after preprocessing: {pod_date}")
-                    if bol_data["stamp"]["stamp_exist"] and bol_data["stamp"]["pod_sign"]:
-        
-                        if pod_date in ["null", "empty", "Error Processing Date"] and processed_bill_date in ["null", "empty", "Error Processing Date"]:
-                            POD_FIELDS["POD Date"] = get_yesterday_date()
-                            print(f"Using yesterday's date due to invalid POD and bill date: {POD_FIELDS['POD Date']}")
-                        else:
-                            if pod_date not in ["null", "empty", "Error Processing Date"]:
-                                try:
-                                    date_parts = pod_date.split('/')
-                                    if len(date_parts) >= 2:
-                                        # Check if pod_date is in DD/YY format (needs month from bill date)
-                                        first_num = int(date_parts[0])
-                                        if first_num > 12 and month_bill is not None: # First number must be a day
-                                            pod_month = month_bill
-                                            pod_day = first_num
-                                        else:
-                                            pod_month = int(date_parts[0])
-                                            pod_day = int(date_parts[1])
-                                        pod_year = extracted_year
-                                        
-                                        print(f"Initial parsed POD date values - Month: {pod_month}, Day: {pod_day}, Year: {pod_year}")
-                                        
-                                        # Only compare with bill date if it's not null
-                                        if processed_bill_date not in ["null", "empty", "Error Processing Date"]:
-                                            print(f"Bill date values for comparison - Month: {month_bill}, Day: {day_bill}, Year: {extracted_year}")
-                            
-                                            # If month_bill is None or invalid (12/31), use POD month
-                                            if month_bill is None or (month_bill == 12 and day_bill == 31):
-                                                month_bill = pod_month
-                                                if day_bill is None:
-                                                    day_bill = pod_day
-                            
-                                            # Modified logic for date replacement - only if bill date exists
-                                            if month_bill is not None and day_bill is not None:
-                                                if pod_month > month_bill:
-                                                    if pod_month == month_bill + 1 and pod_day < day_bill:
-                                                        print("Special case: POD month is one month greater but POD day is less than bill day")
-                                                        pass
-                                                    else:
-                                                        print(f"Adjusting POD month from {pod_month} to bill month {month_bill}")
-                                                        pod_month = month_bill
-                                                        # When adjusting to bill month, POD day must be >= bill day
-                                                        if pod_day < day_bill:
-                                                            print(f"Adjusting POD day from {pod_day} to bill day {day_bill} as POD day cannot be less than bill day")
-                                                            pod_day = day_bill
-                                                elif pod_month < month_bill:
-                                                    print(f"POD month {pod_month} is less than bill month {month_bill}, adjusting")
-                                                    pod_month = month_bill
-                                                    # When adjusting to bill month, POD day must be >= bill day
-                                                    if pod_day < day_bill:
-                                                        print(f"Adjusting POD day from {pod_day} to bill day {day_bill} as POD day cannot be less than bill day")
-                                                        pod_day = day_bill
-                                                elif pod_month == month_bill and pod_day < day_bill:
-                                                    print(f"Same month, adjusting POD day from {pod_day} to bill day {day_day}")
-                                                    pod_day = day_bill
-                                        else:
-                                            # If bill date is null, use POD date as is
-                                            print("Bill date is null, using POD date without modifications")
-                                            
-                                        print(f"Pre-adjustment date values - Month: {pod_month}, Day: {pod_day}, Year: {pod_year}")
-                                        # Ensure valid date after adjustments
-                                        adjusted_month, adjusted_day, adjusted_year = adjust_date(pod_month, pod_day, pod_year or datetime.now().year)
-                                        print(f"Post-adjustment date values - Month: {adjusted_month}, Day: {adjusted_day}, Year: {adjusted_year}")
+                    # Check stamp validity
+                    if ((bol_data["stamp"].get("stamp_exist") in ["yes", True, "True"] or
+                         bol_data["stamp"].get("notation_exist") in ["yes", True, "True"]) and
+                        bol_data["stamp"].get("pod_sign") in ["yes", "no", True, False, "True", "False"]):
                         
-                                        current_year = datetime.now().year
-                                        current_month = datetime.now().month
-                                        current_day = datetime.now().day
-                                        
-                                        if adjusted_year > current_year or str(adjusted_year)[-2:] == "23" or str(adjusted_year)[-2:] < "20":
-                                            print(f"Adjusting year from {adjusted_year} to current year {current_year}")
-                                            adjusted_year = current_year
-        
-                                        # If year is current year, ensure month is not greater than current month
-                                        if adjusted_year == current_year:
-                                            if adjusted_month > current_month:
-                                                print(f"Month {adjusted_month} is greater than current month {current_month}, adjusting month to current month")
-                                                adjusted_month = current_month
-                                                # When adjusting to current month, set day to current day
-                                                if adjusted_day > current_day:
-                                                    adjusted_day = current_day - 1
-                                                    print(f"Adjusted day to {adjusted_day} to match current month")
-                                        
-                                        # Format POD Date
-                                        POD_FIELDS["POD Date"] = f"{adjusted_month:02d}/{adjusted_day:02d}/{adjusted_year % 100:02d}"
-                                        print(f"Final POD Date set to: {POD_FIELDS['POD Date']}")
-                                    else:
-                                        if month_bill is not None and day_bill is not None and extracted_year is not None:
-                                            POD_FIELDS["POD Date"] = f"{month_bill:02d}/{day_bill:02d}/{extracted_year % 100:02d}"
-                                            print(f"Using bill date due to invalid POD date parts: {POD_FIELDS['POD Date']}")
-                                        else:
-                                            POD_FIELDS["POD Date"] = get_yesterday_date()
-                                            print(f"Using yesterday's date due to invalid date parts: {POD_FIELDS['POD Date']}")
-                                except (ValueError, IndexError) as e:
-                                    print(f"Error processing POD date: {e}")
-                                    if month_bill is not None and day_bill is not None and extracted_year is not None:
-                                        POD_FIELDS["POD Date"] = f"{month_bill:02d}/{day_bill:02d}/{extracted_year % 100:02d}"
-                                        print(f"Using bill date due to processing error: {POD_FIELDS['POD Date']}")
-                                    else:
-                                        POD_FIELDS["POD Date"] = get_yesterday_date()
-                                        print(f"Using yesterday's date due to processing error: {POD_FIELDS['POD Date']}")
-                            else:
-                                if month_bill is not None and day_bill is not None and extracted_year is not None:
-                                    POD_FIELDS["POD Date"] = f"{month_bill:02d}/{day_bill:02d}/{extracted_year % 100:02d}"
-                                    print(f"Using bill date due to invalid POD date: {POD_FIELDS['POD Date']}")
-                                else:
-                                    POD_FIELDS["POD Date"] = get_yesterday_date()
-                                    print(f"Using yesterday's date due to invalid dates: {POD_FIELDS['POD Date']}")
-            
+                        # Valid stamp - prefer POD date, then bill date, then yesterday
+                        if pod_date not in ["null", "empty", "Error Processing Date"]:
+                            POD_FIELDS["POD Date"] = pod_date
+                            logger.info(f"✅ Using POD date: {POD_FIELDS['POD Date']}")
+                        elif processed_bill_date not in ["null", "empty", "Error Processing Date"]:
+                            POD_FIELDS["POD Date"] = processed_bill_date
+                            logger.info(f"Using bill date: {POD_FIELDS['POD Date']}")
+                        else:
+                            POD_FIELDS["POD Date"] = pod_date
+                            logger.info(f"Using yesterday date: {POD_FIELDS['POD Date']}")
+                    else:
+                        # Invalid stamp
+                        POD_FIELDS["POD Date"] = "null"
+                        POD_FIELDS["Signature Exists"] = "null"
+                        POD_FIELDS["Stamp Exists"] = "null"
+                        POD_FIELDS["Status"] = "invalid"
+                        logger.info("Invalid stamp - setting POD date to null")
+                    
+                    # Set basic fields
                     POD_FIELDS["B/L Number"] = bol_data["bill_of_lading"]["bill_no"]
-                    POD_FIELDS["Issued Qty"] = bol_data["customer_order_info"]["total_order_quantity"]
+                    POD_FIELDS["Issued Qty"] = safe_int_conversion(
+                        bol_data["customer_order_info"]["total_order_quantity"], 0
+                    )
                     POD_FIELDS["Stamp Exists"] = bol_data["stamp"]["stamp_exist"]
                     POD_FIELDS["Seal Intact"] = bol_data["stamp"]["seal_intact"]
                     POD_FIELDS["Signature Exists"] = bol_data["stamp"]["pod_sign"]
-    
-                    # FIX: Add signature fallback logic - if stamp pod_sign is null/empty, try signatures region
-                    if (bol_data["stamp"]["pod_sign"] in ["null", "empty", "", None] and 
+                    
+                    # Signature fallback
+                    if (bol_data["stamp"]["pod_sign"] in ["null", "empty", "", None] and
                         "signatures" in bol_data and bol_data["signatures"].get("receiver_signature")):
                         POD_FIELDS["Signature Exists"] = bol_data["signatures"]["receiver_signature"]
-                        print(f"Using signatures region fallback: {POD_FIELDS['Signature Exists']}")
-    
-                    if bol_data["stamp"]["total_received"] not in ["null", "empty", "0"]:
-                        if int(bol_data["customer_order_info"]["total_order_quantity"]) == int(bol_data["stamp"]["total_received"]):
-                            (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = 0, 0, 0, 0
-                            POD_FIELDS["Received Qty"] = int(bol_data["stamp"]["total_received"])
-                        else:
-                            (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = (
-                                bol_data["stamp"]["refused"],
-                                bol_data["stamp"]["short"],
-                                bol_data["stamp"]["damage"],
-                                bol_data["stamp"]["over"],
-                            )
-                            POD_FIELDS["Received Qty"] = int(bol_data["stamp"]["total_received"])
-                    else:
-                        (POD_FIELDS["Refused Qty"], POD_FIELDS["Short Qty"], POD_FIELDS["Damage Qty"], POD_FIELDS["Over Qty"]) = (
-                            bol_data["stamp"]["refused"],
-                            bol_data["stamp"]["short"],
-                            bol_data["stamp"]["damage"],
-                            bol_data["stamp"]["over"],
-                        )
-                        POD_FIELDS["Received Qty"] = bol_data["stamp"]["total_received"]
-                    #______________________________________________________________________________________________________________________________________________FIX-18
-    
-    
-                    # Updated check with type handling
-                    received_qty = str(POD_FIELDS['Received Qty']).lower()
-                    issued_qty = str(POD_FIELDS['Issued Qty']).lower()
-
-                    print(f"End of post_process: {datetime.now()}")
-
+                        logger.info("Using signatures region fallback")
                     
-                    # Check and handle invalid 'Received Qty'
-                        #__________________________________________________________________________________________________________________________________________________________FIX-18
-                    if received_qty in ["null", "empty", "", "n/a", "0"] and issued_qty not in ["null", "empty", "", "n/a", "0"]:
-                        if bol_data["stamp"]["stamp_exist"] == "yes":
-                            # Check if total_received field exists and has a value in the stamp
-                            stamp_total_received = bol_data["stamp"].get("total_received", "null")
-                            
-                            if stamp_total_received in ["null", "empty", "", "N/A"]:
-                                # total_received is not present on stamp - keep as null
-                                POD_FIELDS['Received Qty'] = "null"
-                                POD_FIELDS['Damage Qty'] = "null"
-                                POD_FIELDS['Short Qty'] = "null"
-                                POD_FIELDS['Over Qty'] = "null"
-                                POD_FIELDS['Refused Qty'] = "null"
-                                POD_FIELDS["Status"] = "incomplete_data"
-                            else:
-                                # total_received is present on stamp but invalid in receipt - assume full delivery
-                                POD_FIELDS['Received Qty'] = int(POD_FIELDS['Issued Qty'])
-                                POD_FIELDS['Damage Qty'] = 0
-                                POD_FIELDS['Short Qty'] = 0
-                                POD_FIELDS['Over Qty'] = 0
-                                POD_FIELDS['Refused Qty'] = 0
-                                POD_FIELDS["Status"] = "valid"
-                        else:
-                            # Existing logic for invalid stamp
-                            POD_FIELDS['Received Qty'] = "null"
-                            POD_FIELDS['Damage Qty'] = "null"
-                            POD_FIELDS['Short Qty'] = "null"
-                            POD_FIELDS['Over Qty'] = "null"
-                            POD_FIELDS['Refused Qty'] = "null"
-                            POD_FIELDS["POD Date"] = "null"
-                            POD_FIELDS["Signature Exists"] = "null"
-                            POD_FIELDS["Stamp Exists"] = "null"
-                            POD_FIELDS["Status"] = "invalid"
-                    else:
-                        POD_FIELDS["Status"] = "valid"
-                        
-                    POD_FIELDS_LIST.append(POD_FIELDS)
+                    # Process quantities
+                    stamp_total_received = safe_int_conversion(bol_data["stamp"]["total_received"], 0)
+                    stamp_total_received_str = safe_str_conversion(bol_data["stamp"]["total_received"], "null")
+                    customer_order_qty = safe_int_conversion(
+                        bol_data["customer_order_info"]["total_order_quantity"], 0
+                    )
                     
+                    POD_FIELDS = process_quantities(
+                        bol_data,
+                        stamp_total_received,
+                        stamp_total_received_str,
+                        customer_order_qty,
+                        POD_FIELDS,
+                        POD_FIELDS.get("Customer_Order_Num","null")
+                    )
+                    
+                    logger.info(f"End of post_process: {datetime.now()}")
+                    
+                    # Validate received quantity
+                    POD_FIELDS = validate_received_qty(POD_FIELDS, bol_data)
+                
+                POD_FIELDS_LIST.append(POD_FIELDS)
+        
         return POD_FIELDS_LIST
-
+    
     except Exception as e:
-        from traceback import print_exc
-        print(print_exc())
+        logger.exception("Error during OCR analysis")
         raise HTTPException(status_code=500, detail=f"Error during analysis: {str(e)}")

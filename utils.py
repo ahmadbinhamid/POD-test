@@ -7,11 +7,15 @@ import re
 from typing import Union, List
 import base64
 from pathlib import Path
-import datetime
 import pickle
 from io import BytesIO
 import uuid
 
+import re
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # ImageNet normalization constants
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -251,73 +255,172 @@ def base64topil(img_str):
         print(f"Error processing image: {e}")
         return None
 
-def adjust_date(month, day, year=None):
-    """
-    Adjust invalid date values to nearest valid date
-    Args:
-        month: Month number
-        day: Day number
-        year: Optional year number
-    Returns:
-        Tuple of adjusted (month, day, year)
-    """
-    current_year = datetime.datetime.now().year
-    year_to_use = year if year is not None else current_year
-    month = min(max(month, 1), 12)
-    day = max(day, 1)
-    last_day = (datetime.date(year_to_use, month, 1) + datetime.timedelta(days=31)).replace(day=1) - datetime.timedelta(days=1)
-    return month, min(day, last_day.day), year_to_use
+
+# Month name mappings
+MONTHS = {
+    'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
+    'May': '05', 'Jun': '06', 'Jul': '07', 'Aug': '08',
+    'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12'
+}
 
 def preprocess_date(date_str):
     """
-    Normalize date string to MM/DD/YY format
-    Args:
-        date_str: Input date string in various formats
-    Returns:
-        Normalized date string or error message
+    Normalize date string to MM/DD/YY or MM/DD format
+    Handles formats: 02-09-24, 02/09/24, Oct 24 2024, Oct-24-2024, 02.09.24, 02/09
     """
     try:
-        # Clean input
+        # Handle null/empty cases
+        if not date_str or date_str in ["null", "empty", None, "", "N/A"]:
+            return "null"
+
+        # Clean input - preserve hyphens for now
+        date_str = str(date_str).strip()
+
+        # Remove time components (e.g., "10/31/25 07:00" -> "10/31/25")
+        # This handles HH:MM, H:MM, and am/pm formats
+        date_str = re.sub(r'\s+\d{1,2}:\d{2}.*$', '', date_str)  # Remove time with colon
+        date_str = re.sub(r'\s+\d{1,2}(am|pm)?$', '', date_str, flags=re.IGNORECASE)  # Remove hour only
+
+        # Collapse multiple spaces
         date_str = re.sub(r'\s+', ' ', date_str).strip()
-        date_str = re.sub(r'[.,]', '/', date_str)
-
-        # Handle text month format
-        match = re.match(r'^([A-Za-z]{3,})[ /]*(\d{1,2})[ /]*(\d{2,4})?$', date_str)
-        if match:
-            month, day, year = match.groups()
-            month = MONTHS.get(month[:3].title(), month)
+        
+        # Handle text month formats: "Oct 24 2024", "Oct - 24 - 2024", "Oct-24-2024"
+        text_match = re.match(
+            r'^([A-Za-z]{3,})\s*[-/\s]*(\d{1,2})(?:\s*[-/\s]*(\d{2,4}))?$', 
+            date_str
+        )
+        if text_match:
+            month_name, day, year = text_match.groups()
+            month = MONTHS.get(month_name[:3].title())
+            
+            if not month:
+                logger.warning(f"Invalid month name: {month_name}")
+                return "null"
+            
             day = int(day)
-            year = int(year) if year else None
-            month, day, year = adjust_date(int(month), day, year)
-            return f"{month}/{day}" if year is None else f"{month}/{day}/{str(year)[-2:]}"
+            
+            # Validate ranges
+            if int(month) < 1 or int(month) > 12:
+                return "null"
+            if day < 1 or day > 31:
+                return "null"
+            
+            # Return with or without year
+            if year:
+                year_int = int(year)
+                month_int, day_adj, year_adj = adjust_date(int(month), day, year_int)
+                return f"{month_int:02d}/{day_adj:02d}/{str(year_adj)[-2:]}"
+            else:
+                return f"{int(month):02d}/{day:02d}"
 
-        # Handle numeric formats
-        date_str = date_str.replace('-', '/')
+        # Replace dots and hyphens with slashes for consistent parsing
+        date_str = date_str.replace('.', '/').replace('-', '/')
         parts = date_str.split('/')
 
-        if len(parts) == 2:
-            first_num = int(parts[0])
-            if first_num > 12:
-                return f"{first_num}/{parts[1]}"
+        # Validate all parts are numeric before processing
+        if not all(part.strip().isdigit() for part in parts if part.strip()):
+            logger.warning(f"Date contains non-numeric parts: {date_str}")
+            return "null"
 
+        # Two parts: MM/DD (no year)
+        if len(parts) == 2:
+            month, day = int(parts[0]), int(parts[1])
+            
+            # Validate ranges
+            if month < 1 or month > 12:
+                logger.warning(f"Invalid month: {month}")
+                return "null"
+            if day < 1 or day > 31:
+                logger.warning(f"Invalid day: {day}")
+                return "null"
+            
+            # Return as MM/DD format
+            return f"{month:02d}/{day:02d}"
+
+        # Three parts: MM/DD/YY or MM/DD/YYYY
         if len(parts) == 3:
             month, day, year = map(int, parts)
+            
+            # Validate ranges
+            if month < 1 or month > 12:
+                logger.warning(f"Invalid month: {month}")
+                return "null"
+            if day < 1 or day > 31:
+                logger.warning(f"Invalid day: {day}")
+                return "null"
+            
+            # Adjust for impossible dates
             month, day, year = adjust_date(month, day, year)
-            return f"{month}/{day}/{str(year)[-2:]}"
+            
+            # Return with 2-digit year
+            return f"{month:02d}/{day:02d}/{str(year)[-2:]}"
 
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            num1, num2 = map(int, parts)
-            if num1 <= 12:
-                month, day, _ = adjust_date(num1, num2, None)
-                return f"{month}/{day}"
-            return f"{num1}/{num2}"
-
+        # If format doesn't match, return null
+        logger.warning(f"Date format doesn't match: {date_str}")
         return date_str
 
-    except Exception:
-        from traceback import print_exc
-        print(print_exc())
-        return "Error Processing Date"
+    except Exception as e:
+        logger.error(f"Error processing date '{date_str}': {e}")
+        return "null"
+
+
+def adjust_date(month, day, year=None):
+    """
+    Adjust ONLY invalid date values (like Feb 31) to nearest valid date.
+    Does NOT modify dates based on current date - past/future dates are valid.
+    """
+    current_year = datetime.now().year
+    year_to_use = year if year is not None else current_year
+    
+    # Clamp month to valid range (1-12)
+    month = min(max(month, 1), 12)
+    
+    # Clamp day to valid range for the given month/year
+    day = max(day, 1)
+    
+    # Calculate last valid day of the month
+    from datetime import date, timedelta
+    if month == 12:
+        last_day = date(year_to_use, 12, 31)
+    else:
+        last_day = (date(year_to_use, month + 1, 1) - timedelta(days=1))
+    
+    day = min(day, last_day.day)
+    
+    return month, day, year_to_use
+
+
+# Test cases
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    test_cases = [
+        ("02-09-24", "02/09/24"),
+        ("02-09-2024", "02/09/24"),
+        ("02/09/24", "02/09/24"),
+        ("02/09/2024", "02/09/24"),
+        ("Oct 24 2024", "10/24/24"),
+        ("Oct - 24 2024", "10/24/24"),
+        ("Oct - 24 - 2024", "10/24/24"),
+        ("02.09.24", "02/09/24"),
+        ("02.09.2024", "02/09/24"),
+        ("02/09", "02/09"),
+        
+        # Edge cases
+        ("11/13", "11/13"),
+        ("3/21", "03/21"),
+        ("", "null"),
+        ("null", "null"),
+    ]
+    
+    print("\n" + "="*70)
+    print("DATE PREPROCESSING TESTS")
+    print("="*70 + "\n")
+    
+    for input_date, expected in test_cases:
+        result = preprocess_date(input_date)
+        status = "✅ PASS" if result == expected else f"❌ FAIL (expected: {expected})"
+        print(f"{status:15} | Input: {str(input_date):20} | Output: {result}")
 
 def validate_customer_number(customer_number, all_numbers=None):
     """
@@ -383,3 +486,197 @@ def resize_large_image(img: Image.Image, max_pixels: int = 178956970) -> Image.I
         new_height = int(height * scale)
         return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
     return img
+
+# type conversion helpers
+def safe_int_conversion(value, default=0):
+    """
+    Safely convert OCR output to integer, handling various edge cases.
+    
+    Args:
+        value: Input value from OCR (can be int, float, str, or None)
+        default: Default value to return if conversion fails
+        
+    Returns:
+        Integer value or default
+        
+    Examples:
+        safe_int_conversion(40.375) -> 40
+        safe_int_conversion("40.375") -> 40
+        safe_int_conversion("40") -> 40
+        safe_int_conversion("null") -> 0
+        safe_int_conversion(None) -> 0
+    """
+    try:
+        # Handle None and empty values
+        if value is None or value == "":
+            return default
+            
+        # Handle string values
+        if isinstance(value, str):
+            value = value.strip().lower()
+            # Handle common null/empty representations
+            if value in ["null", "empty", "n/a", "na", "none", ""]:
+                return default
+            # Remove any whitespace and convert
+            value = value.replace(" ", "")
+        
+        # Convert to float first (handles both int and float strings)
+        # Then convert to int (truncates decimal part)
+        return int(float(value))
+        
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Failed to convert '{value}' to int: {e}. Using default: {default}")
+        return default
+
+def safe_float_conversion(value, default=None):
+    """
+    Safely convert any value to float
+    
+    Args:
+        value: Value to convert (can be str, int, float, or any type)
+        default: Default value if conversion fails
+    
+    Returns:
+        float or default value
+    """
+    if value in ["null", "empty", "N/A", "", None]:
+        return default
+    
+    try:
+        # Handle string with commas
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+        
+        return float(value)
+    except (ValueError, TypeError, AttributeError):
+        return default
+
+def safe_str_conversion(value, default="null"):
+    """
+    Safely convert OCR output to string, handling various edge cases.
+    
+    Args:
+        value: Input value from OCR (can be any type)
+        default: Default value to return if conversion fails
+        
+    Returns:
+        String value or default
+    """
+    try:
+        if value is None:
+            return default
+        
+        # Convert to string
+        str_value = str(value).strip().lower()
+        
+        # Handle empty strings
+        if str_value == "":
+            return default
+            
+        return str_value
+        
+    except Exception as e:
+        logger.warning(f"Failed to convert '{value}' to str: {e}. Using default: {default}")
+        return default
+
+
+def safe_numeric_operation(val1, val2, operation="add", default=0):
+    """
+    Safely perform numeric operations on OCR values.
+    
+    Args:
+        val1: First value
+        val2: Second value
+        operation: Operation to perform ("add", "subtract", "multiply", "divide")
+        default: Default value if operation fails
+        
+    Returns:
+        Result of operation or default value
+    """
+    try:
+        # Convert both values to integers
+        num1 = safe_int_conversion(val1, 0)
+        num2 = safe_int_conversion(val2, 0)
+        
+        if operation == "add":
+            return num1 + num2
+        elif operation == "subtract":
+            return num1 - num2
+        elif operation == "multiply":
+            return num1 * num2
+        elif operation == "divide":
+            return num1 / num2 if num2 != 0 else default
+        else:
+            logger.warning(f"Unknown operation: {operation}")
+            return default
+            
+    except Exception as e:
+        logger.error(f"Error in numeric operation {operation}({val1}, {val2}): {e}")
+        return default
+
+
+def normalize_ocr_data(ocr_data: dict, field_types: dict) -> dict:
+    """
+    Normalize OCR data based on expected field types
+    
+    Args:
+        ocr_data: Raw OCR response data
+        field_types: Dictionary mapping field names to expected types (int, str, float)
+    
+    Returns:
+        Normalized OCR data
+    """
+    normalized = {}
+    
+    for field, expected_type in field_types.items():
+        value = ocr_data.get(field)
+        
+        if expected_type == int:
+            normalized[field] = safe_int_conversion(value, "null")
+        elif expected_type == float:
+            normalized[field] = safe_float_conversion(value, "null")
+        elif expected_type == str:
+            normalized[field] = safe_str_conversion(value, "null")
+        else:
+            normalized[field] = value
+    
+    # Copy any remaining fields not in field_types
+    for field, value in ocr_data.items():
+        if field not in normalized:
+            normalized[field] = value
+    
+    return normalized
+
+def heuristic_stamp_crop_base64(image: str):
+    """
+    Heuristic fallback to crop stamp region from BOL image
+    Uses bottom-right quadrant as stamp is typically located there
+    
+    Args:
+        image: Base64 encoded image string
+    
+    Returns:
+        Base64 encoded cropped stamp region or None if crop fails
+    """
+    try:
+        pil_img = base64topil(image)
+        width, height = pil_img.size
+        
+        # Crop bottom-right quadrant (typical stamp location)
+        # Taking 40% from right and 30% from bottom
+        left = int(width * 0.6)
+        top = int(height * 0.7)
+        right = width
+        bottom = height
+        
+        cropped = pil_img.crop((left, top, right, bottom))
+        
+        # Basic quality check - ensure cropped region is not too small
+        if cropped.width >= 50 and cropped.height >= 50:
+            return convert_image_to_base64(cropped)
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error in heuristic stamp crop: {e}")
+        return None

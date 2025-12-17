@@ -14,7 +14,7 @@ import models
 
 load_dotenv()
 app = FastAPI()
-
+  
 # Initialize model and tokenizer
 MODEL_PATH = "OpenGVLab/InternVL2-8B"
 model = (
@@ -42,9 +42,12 @@ def load_image(image, input_size=448, max_num=12):
     if isinstance(image, str):
         if image.startswith(("http://", "https://")):
             # Handle URL input
-            with requests.get(image) as response:
+            response = requests.get(image, timeout=10)
+            try:
                 response.raise_for_status()
                 image = Image.open(BytesIO(response.content)).convert("RGB")
+            finally:
+                response.close()
         elif image.startswith("data:image"):
             # Handle inline base64 image
             header, base64_data = image.split(",", 1)

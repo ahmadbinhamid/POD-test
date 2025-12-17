@@ -63,18 +63,29 @@ class Stamp(BaseModel):
     total_received: Optional[Union[int, str]] = Field(
         None, description="Number of cartons received (non-negative integer or '-')"
     )
+    notation_exist: Optional[str] = Field(
+        None, description="Whether notation was present or not ('yes', 'no')"
+    )
 
 class CustomerOrderInfo(BaseModel):
     total_order_quantity: int = Field(0, description="Total number of packages handled")
 
 
 class Signatures(BaseModel):
-    
+
     receiver_signature: str = Field(
         default=None,
         pattern="^(yes|no)$",
         description="Indicates whether the receiver has provided a signature. Accepts 'yes' or 'no'."
     )
+
+    @field_validator('receiver_signature', mode='before')
+    @classmethod
+    def handle_null_string(cls, v):
+        """Convert 'null' string and other invalid values to 'no'"""
+        if v in ['null', 'N/A', 'empty', '', None]:
+            return 'no'
+        return v
 
 class DeliveryReceipt(BaseModel):
 
