@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Optional, Union, Dict, List
 from datetime import date
 from PIL import Image
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
 
 
 class InterVL2Request(BaseModel):
@@ -238,3 +240,106 @@ class PODResponse(BaseModel):
 
     class Config:
         populate_by_name = True
+
+# Template sync models
+class TemplateSyncRequest(BaseModel):
+    """Request model for template sync endpoint"""
+    action: str = Field(..., description="Action: 'add', 'remove', or 'update'")
+    template: Optional[Dict[str, Any]] = Field(None, description="Template data (for add/update)")
+    template_id: Optional[str] = Field(None, description="Template ID (for remove)")
+
+
+class TemplateSyncResponse(BaseModel):
+    """Response model for template sync endpoint"""
+    success: bool
+    message: str
+    template_id: Optional[str] = None
+    stats: Optional[Dict[str, Any]] = None
+
+
+# Enhanced OCR models
+class ClassificationDetails(BaseModel):
+    """Classification details from YOLO models"""
+    primary_model_prediction: str = Field(..., description="Primary category (BOL/Receipt/Others)")
+    primary_confidence: float = Field(..., description="Confidence of primary prediction")
+    secondary_model_prediction: Optional[str] = Field(None, description="Secondary category if applicable")
+    secondary_confidence: Optional[float] = Field(None, description="Confidence of secondary prediction")
+
+
+class SuggestedTemplate(BaseModel):
+    """Suggested template with match score"""
+    template_id: str
+    template_name: str
+    match_score: float
+    priority: int
+
+
+class EnhancedOCRResponse(BaseModel):
+    """
+    Enhanced OCR Response with template information
+    EXTENDS existing PODResponse model
+    """
+    # Original fields (keep all existing fields from PODResponse)
+    B_L_Number: str = ""
+    Stamp_Exists: str = ""
+    Seal_Intact: str = "null"
+    POD_Date: str = ""
+    Signature_Exists: str = ""
+    Issued_Qty: int = 0
+    Received_Qty: int = 0
+    Damage_Qty: str = "0"
+    Short_Qty: str = "0"
+    Over_Qty: str = "0"
+    Refused_Qty: str = "null"
+    Customer_Order_Num: str = "null"
+    
+    # 🆕 NEW FIELDS
+    template_id: Optional[str] = Field(None, description="Matched template ID or null if unregistered")
+    confidence: float = Field(0.0, description="Template match confidence score")
+    processing_time: int = Field(0, description="Processing time in milliseconds")
+    classification_details: Optional[ClassificationDetails] = Field(None, description="Classification details")
+    suggested_templates: List[SuggestedTemplate] = Field(default_factory=list, description="Top 3 suggested templates")
+
+
+# Template test models
+class TemplateTestRequest(BaseModel):
+    """Request model for template testing endpoint"""
+    file_url: str = Field(..., description="URL of document to test")
+    template: Dict[str, Any] = Field(..., description="Complete template JSON")
+    user_id: Optional[str] = Field(None, description="User ID for logging")
+
+
+class TemplateTestResponse(BaseModel):
+    """Response model for template testing"""
+    success: bool
+    extracted_data: Optional[EnhancedOCRResponse] = None
+    error: Optional[str] = None
+    processing_time: int = 0
+
+
+# Enhanced OCR Request (extends existing OCRRequest)
+class EnhancedOCRRequest(BaseModel):
+    """
+    Enhanced OCR Request
+    Supports normal flow and unregistered document processing
+    """
+    file_url: str = Field(..., description="URL of document to process")
+    user_id: Optional[str] = Field(None, description="User ID for logging")
+    template_id: Optional[str] = Field(None, description="Template ID for unregistered doc processing")
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "file_url": "https://example.com/document.pdf",
+                "user_id": "user123",
+                "template_id": None  # None for normal flow, provide ID for unregistered docs
+            }
+        }
+
+
+# Memory store stats
+class MemoryStoreStats(BaseModel):
+    """Statistics about template memory store"""
+    total_templates: int
+    categories: List[str]
+    templates_by_category: Dict[str, int]

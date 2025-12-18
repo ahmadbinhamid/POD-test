@@ -86,3 +86,7 @@ openai>=1.6.0
 jinja2
 hf_transfer
 nvidia-ml-py
+
+imagehash
+pytesseract
+pillow

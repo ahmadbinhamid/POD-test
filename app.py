@@ -1,166 +1,34 @@
-# from fastapi import FastAPI, File, UploadFile, HTTPException
-# from fastapi.middleware.cors import CORSMiddleware
-# from fastapi.responses import ORJSONResponse
-# from typing import List
-# from langsmith import traceable
-# from dotenv import load_dotenv
-# import os
-# import asyncio
-# from ultralytics import YOLO
-
-# import models
-# from models import OCRRequest, PODResponse
-# from main import run_ocr  # We'll replace run_ocr_parallel
-
-# load_dotenv()
-
-# app = FastAPI(default_response_class=ORJSONResponse)
-
-# # Enable CORS
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # ========== GLOBALS ==========
-# YOLO_MODEL = YOLO("doc_classify_best.pt")
-# YOLO_QUEUE = asyncio.Queue()
-# def get_classifier():
-#     return YOLO_MODEL
-# # ========== GPU Inference Background Worker ==========
-# async def gpu_worker():
-#     while True:
-#         job = await YOLO_QUEUE.get()
-#         try:
-#             images = job["images"]
-#             conf = job.get("conf", 0.55)
-#             batch = job.get("batch", len(images))
-#             result = YOLO_MODEL.predict(images, conf=conf, batch=batch)
-#             job["future"].set_result(result)
-#         except Exception as e:
-#             job["future"].set_exception(e)
-#         YOLO_QUEUE.task_done()
-
-# # Launch the GPU worker at startup
-# @app.on_event("startup")
-# async def startup_event():  
-    
-#     # asyncio.create_task(gpu_worker())
-#     for _ in range(4):
-        
-#         asyncio.create_task(gpu_worker())
-
-# # ========== CLASSIFY via YOLO QUEUE ==========
-# async def classify_with_gpu_queue(images, conf=0.55, batch=5):
-#     loop = asyncio.get_event_loop()
-#     future = loop.create_future()
-#     await YOLO_QUEUE.put({
-#         "images": images,
-#         "conf": conf,
-#         "batch": batch,
-#         "future": future
-#     })
-#     return await future
-
-# # # ========== OCR Endpoint (Upload + Classify + OCR) ==========
-# # @app.post("/ocr")
-# # async def handle_user_ocr(file: UploadFile = File(...)):
-# #     try:
-# #         os.makedirs("./tmp", exist_ok=True)
-# #         file_path = os.path.join("./tmp", file.filename)
-# #         with open(file_path, "wb") as f:
-# #             f.write(await file.read())
-
-# #         # 🔁 Call your OCR logic with GPU batching here
-# #         result = await run_ocr(file_path, classify_with_gpu_queue)  # <-- use new GPU batch logic
-        
-# #         return {"status": "success", "data": result}
-
-# #     except Exception as e:
-# #         return {"status": "error", "message": str(e)}
-
-
-# # @app.on_event("startup")
-# # async def load_models():
-# #     print("⚙️  Loading models on startup...")
-
-# #     app.state.bol_region_detector = YOLO("bol_regions_best.pt").to("cpu")
-# #     app.state.page_classifier = YOLO("doc_classify_best.pt").to("cpu")
-# #     app.state.receipt_region_detector = YOLO("receipts_regions_best.pt").to("cpu")
-# #     app.state.stamp_detector = YOLO("stamp_existence.pt").to("cpu")
-
-# #     # Page orientation model
-# #     model = mobilenet_v3_small_page_orientation(
-# #         pretrained=False, pretrained_backbone=False
-# #     )
-# #     params = torch.load("page_orientation.pt", map_location="cpu")
-# #     model.load_state_dict(params)
-# #     app.state.page_orient_predictor = page_orientation_predictor(arch=model, pretrained=False)
-
-# #     print("✅ Models loaded.")
-    
-# # ========== URL-Based OCR ==========
-# @traceable(run_type="chain", name="api")
-# @app.post("/run-ocr", response_model=List[PODResponse])
-# async def analyze_image(ocr_request: OCRRequest):
-#     try:
-#         result = await run_ocr(ocr_request.file_url_or_path)  # pass the inference method
-
-#         responses = []
-#         for item in result:
-#             response_dict = {
-#                 "B_L_Number": item.get("B/L Number"),
-#                 "Stamp_Exists": item.get("Stamp Exists"),
-#                 "Seal_Intact": item.get("Seal Intact"),
-#                 "POD_Date": item.get("POD Date"),
-#                 "Signature_Exists": item.get("Signature Exists"),
-#                 "Issued_Qty": item.get("Issued Qty"),
-#                 "Received_Qty": item.get("Received Qty"),
-#                 "Damage_Qty": item.get("Damage Qty"),
-#                 "Short_Qty": item.get("Short Qty"),
-#                 "Over_Qty": item.get("Over Qty"),
-#                 "Refused_Qty": item.get("Refused Qty"),
-#                 "Customer_Order_Num": item.get("Customer Order Num"),
-#                 "Status": item.get("Status"),
-#                 "_id": ocr_request.id
-#                 # "FILE_DATA": ocr_request.FILE_DATA
-#             }
-#             responses.append(PODResponse.model_validate(response_dict))
-
-#         return responses
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# # ========== Run Server ==========
-# if __name__ == "__main__":
-#     import uvicorn
-#     # uvicorn.run("app:app", host="0.0.0.0", port=8080, workers=4)
-#     uvicorn.run("app:app", host="0.0.0.0", port=8080, workers=1)
-
-
-
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
-from typing import List
+from typing import Optional, List, Dict, Any, Tuple
 from langsmith import traceable
 from dotenv import load_dotenv
 import os
 import asyncio
 from ultralytics import YOLO
-
 import concurrent.futures
 import logging
 
-
 import models
-from models import OCRRequest, PODResponse
+from models import (
+    OCRRequest, 
+    PODResponse,
+    TemplateSyncRequest,
+    TemplateSyncResponse,
+    EnhancedOCRRequest,
+    EnhancedOCRResponse,
+    TemplateTestRequest,
+    TemplateTestResponse,
+    ClassificationDetails,
+    SuggestedTemplate,
+    MemoryStoreStats
+)
+import time
+import numpy as np
 from main import run_ocr
+
+from template_engine import get_template_store, TemplateMatcher, RegionDetector, PromptLoader, PostProcessor
 
 load_dotenv()
 
@@ -172,6 +40,15 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("app")
+
+# Template engine components
+template_store = get_template_store()
+template_matcher = TemplateMatcher()
+region_detector = RegionDetector()
+prompt_loader = PromptLoader()
+post_processor = PostProcessor()
+
+logger.info("Template engine components initialized")
 
 # Enable CORS
 app.add_middleware(
@@ -236,8 +113,6 @@ async def shutdown_event():
 #  START: MODIFIED SECTION FOR CONCURRENT PROCESSING
 # ====================================================================
 
-
-
 CPU_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
 
 def _run_ocr_sync(path: str):
@@ -247,9 +122,6 @@ def _run_ocr_sync(path: str):
 async def run_ocr_async(path: str):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(CPU_POOL, _run_ocr_sync, path)
-
-
-
 
 async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODResponse]:
     """
@@ -296,108 +168,410 @@ async def process_single_ocr_request(ocr_request: OCRRequest) -> List[PODRespons
 
 
 @traceable(run_type="chain", name="api_batch_ocr")
-@app.post("/run-ocr", response_model=List[PODResponse])
-async def analyze_images_concurrently(ocr_requests: List[OCRRequest]):
+
+# ============================================================================
+# 🆕 STEP 3: ADD NEW ENDPOINT - Template Sync
+# ============================================================================
+
+@app.post("/api/templates/sync", response_model=TemplateSyncResponse)
+async def sync_template(request: TemplateSyncRequest):
     """
-    Accepts a list of OCR requests and processes them concurrently with memory-aware batching.
+    Sync template with AI memory store
+    Called by Backend when template status changes
+    
+    Actions:
+    - 'add': Add new active template to memory
+    - 'remove': Remove inactive/deprecated template from memory
+    - 'update': Update existing template in memory
     """
-    import torch
-
-    logger.info(f"\n\n🚀 BATCH OCR PROCESSING START - {len(ocr_requests)} requests\n")
-
-    # Memory-aware processing: check GPU memory before starting
-    if torch.cuda.is_available():
-        try:
-            memory_total = torch.cuda.get_device_properties(0).total_memory
-            memory_allocated = torch.cuda.memory_allocated()
-            memory_free = memory_total - memory_allocated
-            memory_free_gb = memory_free / (1024**3)
-            memory_utilization = (memory_allocated / memory_total) * 100
-
-            logger.info(
-                f"GPU Memory Status:\n"
-                f"  Total: {memory_total / (1024**3):.2f}GB\n"
-                f"  Allocated: {memory_allocated / (1024**3):.2f}GB\n"
-                f"  Free: {memory_free_gb:.2f}GB\n"
-                f"  Utilization: {memory_utilization:.1f}%"
-            )
-
-            # Adjust processing strategy based on available memory
-            if memory_free_gb < 3:  # Less than 3GB free
-                logger.warning(
-                    f"Low GPU memory ({memory_free_gb:.2f}GB free). "
-                    "Processing sequentially with memory cleanup."
+    try:
+        action = request.action.lower()
+        
+        if action == "add" or action == "update":
+            if not request.template:
+                return TemplateSyncResponse(
+                    success=False,
+                    message="Template data required for add/update action"
                 )
-
-                # Process sequentially with aggressive memory cleanup
-                final_responses = []
-                failures = []
-
-                for idx, req in enumerate(ocr_requests):
-                    logger.info(f"Processing request {idx + 1}/{len(ocr_requests)}: {req.id}")
-
-                    try:
-                        result = await process_single_ocr_request(req)
-                        final_responses.extend(result)
-                    except Exception as e:
-                        logger.error(f"Request {req.id} failed: {e}")
-                        failures.append({"error": str(e)})
-
-                    # Clear cache after each request
-                    torch.cuda.empty_cache()
-                    logger.info(f"Memory after cleanup: {torch.cuda.memory_allocated() / (1024**3):.2f}GB")
-
-                if not final_responses and ocr_requests:
-                    ids = [getattr(req, 'id', None) for req in ocr_requests]
-                    logger.error(f"All batch items failed. ids={ids}; failures={failures}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail={
-                            "message": "All OCR requests in the batch failed to process.",
-                            "ids": ids,
-                            "failures": failures,
-                        }
-                    )
-
-                return final_responses
-
-        except Exception as e:
-            logger.warning(f"Could not check GPU memory: {e}. Proceeding with normal processing.")
-
-    # Normal concurrent processing (sufficient memory available)
-    logger.info("Sufficient memory available. Processing concurrently.")
-    tasks = [process_single_ocr_request(req) for req in ocr_requests]
-    results_from_gather = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Flatten the list of lists into a single list of responses
-    final_responses = []
-    failures = []
-    for result in results_from_gather:
-        if isinstance(result, Exception):
-            failures.append({"error": str(result)})
-            continue
-        final_responses.extend(result)
-
-    # If all tasks failed, it might be a server-side issue
-    if not final_responses and ocr_requests:
-        ids = [getattr(req, 'id', None) for req in ocr_requests]
-        logger.error(f"All batch items failed. ids={ids}; failures={failures}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "All OCR requests in the batch failed to process.",
-                "ids": ids,
-                "failures": failures,
-            }
+            
+            success = template_store.add_template(request.template)
+            template_id = request.template.get("template_id")
+            
+            if success:
+                stats = template_store.get_stats()
+                return TemplateSyncResponse(
+                    success=True,
+                    message=f"Template {template_id} {'added' if action == 'add' else 'updated'} successfully",
+                    template_id=template_id,
+                    stats=stats
+                )
+            else:
+                return TemplateSyncResponse(
+                    success=False,
+                    message=f"Failed to {action} template"
+                )
+        
+        elif action == "remove":
+            if not request.template_id:
+                return TemplateSyncResponse(
+                    success=False,
+                    message="Template ID required for remove action"
+                )
+            
+            success = template_store.remove_template(request.template_id)
+            
+            if success:
+                stats = template_store.get_stats()
+                return TemplateSyncResponse(
+                    success=True,
+                    message=f"Template {request.template_id} removed successfully",
+                    template_id=request.template_id,
+                    stats=stats
+                )
+            else:
+                return TemplateSyncResponse(
+                    success=False,
+                    message=f"Template {request.template_id} not found in memory"
+                )
+        
+        else:
+            return TemplateSyncResponse(
+                success=False,
+                message=f"Unknown action: {action}. Use 'add', 'remove', or 'update'"
+            )
+    
+    except Exception as e:
+        logger.error(f"Error in template sync: {e}")
+        return TemplateSyncResponse(
+            success=False,
+            message=f"Error: {str(e)}"
         )
 
-    logger.info(f"\n✅ BATCH OCR COMPLETE - Processed {len(final_responses)} successful responses\n")
-    return final_responses
 
-# ====================================================================
-#  END: MODIFIED SECTION
-# ====================================================================
+# ============================================================================
+# 🆕 STEP 4: ADD NEW ENDPOINT - Template Testing
+# ============================================================================
 
+@app.post("/api/templates/test", response_model=TemplateTestResponse)
+async def test_template(request: TemplateTestRequest):
+    """
+    Test a template that is NOT active/NOT in memory
+    Used by Frontend for testing templates before activation
+    
+    Frontend sends complete template JSON
+    AI processes document with provided template (skips matching)
+    """
+    start_time = time.time()
+    
+    try:
+        # Process document with provided template
+        result = await process_document_with_template(
+            file_url=request.file_url,
+            template=request.template,
+            user_id=request.user_id,
+            skip_matching=True
+        )
+        
+        processing_time = int((time.time() - start_time) * 1000)
+        
+        return TemplateTestResponse(
+            success=True,
+            extracted_data=result,
+            processing_time=processing_time
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in template testing: {e}")
+        processing_time = int((time.time() - start_time) * 1000)
+        
+        return TemplateTestResponse(
+            success=False,
+            error=str(e),
+            processing_time=processing_time
+        )
+
+
+# ============================================================================
+# 🆕 STEP 5: ADD NEW ENDPOINT - Memory Store Stats
+# ============================================================================
+
+@app.get("/api/templates/stats", response_model=MemoryStoreStats)
+async def get_memory_stats():
+    """
+    Get statistics about templates in memory
+    Useful for debugging and monitoring
+    """
+    stats = template_store.get_stats()
+    return MemoryStoreStats(**stats)
+
+
+@app.post("/run-ocr")
+async def analyze_images_concurrently(ocr_requests: List[EnhancedOCRRequest]):
+    """
+    MODIFIED: Enhanced OCR endpoint with template support
+    
+    Handles 3 cases:
+    1. Normal flow: Match template, process if score >= 0.75
+    2. Unregistered doc: template_id in request (skip matching)
+    3. No match: Return suggested templates
+    """
+    results = []
+    
+    # Check GPU memory
+    is_low_memory = check_gpu_memory()
+    
+    if is_low_memory:
+        logger.warning("Low GPU memory detected, processing sequentially")
+        for request in ocr_requests:
+            try:
+                result = await process_single_document_enhanced(request)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error processing document: {e}")
+                results.append(create_error_response(str(e)))
+    else:
+        # Concurrent processing
+        tasks = [process_single_document_enhanced(req) for req in ocr_requests]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle exceptions
+        results = [
+            res if not isinstance(res, Exception) else create_error_response(str(res))
+            for res in results
+        ]
+    
+    return results
+
+async def process_single_document_enhanced(request: EnhancedOCRRequest) -> EnhancedOCRResponse:
+    """
+    Process single document with template support
+    
+    Flow:
+    1. If template_id provided → Skip matching, use that template
+    2. Else → Match templates, use best match if score >= 0.75
+    3. If no match → Return unregistered document with suggestions
+    """
+    start_time = time.time()
+    
+    try:
+        # Download and process document
+        from main import pdf_to_images
+        images = pdf_to_images(request.file_url)
+        
+        if not images:
+            return create_unregistered_response("Failed to process PDF", start_time)
+        
+        image = images[0]  # Process first page
+        
+        # Step 1: Primary classification with YOLO
+        category, primary_confidence = classify_document_category(image)
+        
+        # Step 2: Template handling
+        if request.template_id:
+            # Case: Unregistered document with provided template_id
+            logger.info(f"Processing with provided template: {request.template_id}")
+            template = template_store.get_template(request.template_id)
+            
+            if not template:
+                return create_unregistered_response(
+                    f"Template {request.template_id} not found in memory",
+                    start_time
+                )
+            
+            template_confidence = 1.0  # Direct assignment
+            suggested_templates = []
+        else:
+            # Case: Normal flow - Match templates
+            templates = template_store.get_templates_by_category(category)
+            
+            if not templates:
+                logger.warning(f"No templates found for category: {category}")
+                return create_unregistered_response(
+                    f"No templates available for category: {category}",
+                    start_time,
+                    category,
+                    primary_confidence
+                )
+            
+            # Match templates
+            template, template_confidence, suggested_templates = template_matcher.match_templates(
+                image=image,
+                templates=templates
+            )
+            
+            if not template:
+                logger.info(f"No template matched (best score: {suggested_templates[0]['match_score'] if suggested_templates else 0})")
+                return create_unregistered_response(
+                    "No template matched with confidence >= 0.75",
+                    start_time,
+                    category,
+                    primary_confidence,
+                    suggested_templates
+                )
+        
+        # Step 3: Process with matched template
+        result = await process_document_with_template(
+            file_url=request.file_url,
+            template=template,
+            user_id=request.user_id,
+            image=image
+        )
+        
+        # Add metadata
+        processing_time = int((time.time() - start_time) * 1000)
+        result.template_id = template.get("template_id")
+        result.confidence = template_confidence
+        result.processing_time = processing_time
+        result.classification_details = ClassificationDetails(
+            primary_model_prediction=category,
+            primary_confidence=primary_confidence
+        )
+        result.suggested_templates = suggested_templates
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Error in enhanced processing: {e}")
+        return create_error_response(str(e))
+
+
+async def process_document_with_template(
+    file_url: str,
+    template: Dict,
+    user_id: Optional[str] = None,
+    image: Optional[np.ndarray] = None,
+    skip_matching: bool = False
+) -> EnhancedOCRResponse:
+    """
+    Process document using specific template
+    Used for both matched templates and template testing
+    """
+    try:
+        # Get image if not provided
+        if image is None:
+            from main import pdf_to_images
+            images = pdf_to_images(file_url)
+            if not images:
+                raise Exception("Failed to process PDF")
+            image = images[0]
+        
+        # Get category
+        category = template.get("category", "BOL")
+        
+        # Step 1: Region detection using template config
+        detected_regions = region_detector.detect_regions(image, template, category)
+        
+        if not detected_regions:
+            logger.warning("No regions detected, using full image")
+            detected_regions = {"full_document": image}
+        
+        # Step 2: Load prompts from template
+        prompts = prompt_loader.build_batch_prompts(template, detected_regions)
+        
+        # Step 3: OCR extraction (use existing batch_ocr from main.py)
+        from main import batch_ocr
+        
+        extracted_data = await batch_ocr(
+            regions=detected_regions,
+            prompts=prompts
+        )
+        
+        # Step 4: Apply field mapping
+        mapped_data = post_processor.apply_field_mapping(extracted_data, template)
+        
+        # Step 5: Apply post-processing rules
+        final_data = post_processor.apply_rules(mapped_data, template)
+        
+        # Convert to response model
+        response = EnhancedOCRResponse(**final_data)
+        
+        return response
+    
+    except Exception as e:
+        logger.error(f"Error processing with template: {e}")
+        raise
+
+
+def classify_document_category(image: np.ndarray) -> Tuple[str, float]:
+    """
+    Classify document using existing YOLO model
+    Returns (category, confidence)
+    """
+    try:
+        from main import classify_documents
+        
+        results = classify_documents([image])
+        
+        if results and len(results) > 0:
+            category = results[0].get("category", "Others")
+            confidence = results[0].get("confidence", 0.0)
+            return category, confidence
+        
+        return "Others", 0.0
+    
+    except Exception as e:
+        logger.error(f"Error in classification: {e}")
+        return "Others", 0.0
+
+
+def create_unregistered_response(
+    message: str,
+    start_time: float,
+    category: str = "Others",
+    primary_confidence: float = 0.0,
+    suggested_templates: List[Dict] = None
+) -> EnhancedOCRResponse:
+    """
+    Create response for unregistered documents
+    All data fields are null/0, suggested templates included
+    """
+    processing_time = int((time.time() - start_time) * 1000)
+    
+    return EnhancedOCRResponse(
+        B_L_Number="",
+        Stamp_Exists="",
+        Seal_Intact="null",
+        POD_Date="",
+        Signature_Exists="",
+        Issued_Qty=0,
+        Received_Qty=0,
+        Damage_Qty="0",
+        Short_Qty="0",
+        Over_Qty="0",
+        Refused_Qty="null",
+        Customer_Order_Num="null",
+        template_id=None,
+        confidence=0.0,
+        processing_time=processing_time,
+        classification_details=ClassificationDetails(
+            primary_model_prediction=category,
+            primary_confidence=primary_confidence
+        ),
+        suggested_templates=suggested_templates or []
+    )
+
+
+def create_error_response(error_message: str) -> EnhancedOCRResponse:
+    """Create error response"""
+    return EnhancedOCRResponse(
+        B_L_Number="",
+        Stamp_Exists="",
+        Seal_Intact="null",
+        POD_Date="",
+        Signature_Exists="",
+        Issued_Qty=0,
+        Received_Qty=0,
+        Damage_Qty="0",
+        Short_Qty="0",
+        Over_Qty="0",
+        Refused_Qty="null",
+        Customer_Order_Num="null",
+        template_id=None,
+        confidence=0.0,
+        processing_time=0,
+        classification_details=None,
+        suggested_templates=[]
+    )
 
 # ========== Run Server ==========
 if __name__ == "__main__":
