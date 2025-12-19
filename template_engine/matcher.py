@@ -1,284 +1,305 @@
 """
-Template Matching Algorithm
-Scores templates based on text, visual, layout, and image similarity
+Template Matching Algorithm with DETAILED SCORE LOGGING
+Uses 4-component weighted scoring with comprehensive debugging
 """
 
-import re
-import cv2
-import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 import logging
+import numpy as np
 from PIL import Image
 import imagehash
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("template_engine.matcher")
 
 
 class TemplateMatcher:
     """
-    Template matching with weighted scoring:
-    - Text Patterns: 35%
-    - Visual Features: 30%
-    - Layout Similarity: 20%
-    - Image Hash: 15%
+    Intelligent template matching using multiple algorithms
     """
     
-    THRESHOLD = 0.75
-    TEXT_WEIGHT = 0.35
-    VISUAL_WEIGHT = 0.30
-    LAYOUT_WEIGHT = 0.20
-    IMAGE_WEIGHT = 0.15
-    
     def __init__(self):
-        self.ocr_engine = None  # Will be set if needed
+        logger.info("🎯 TemplateMatcher initialized")
+        # Weights for scoring components
+        self.weights = {
+            "text": 0.35,      # Text pattern matching
+            "visual": 0.30,    # Visual feature similarity
+            "layout": 0.20,    # Layout similarity
+            "image_hash": 0.15 # Perceptual image hashing
+        }
+        
+        logger.info(f"  Scoring weights: {self.weights}")
     
     def match_templates(
-        self,
-        image: np.ndarray,
-        templates: List[Dict],
-        yolo_results: Optional[Dict] = None,
-        extracted_text: Optional[str] = None
+        self, 
+        image: Image.Image, 
+        templates: List[Dict]
     ) -> Tuple[Optional[Dict], float, List[Dict]]:
         """
         Match document image against templates
         
         Args:
-            image: Document image (numpy array)
+            image: PIL Image of document
             templates: List of template dicts
-            yolo_results: Optional YOLO detection results
-            extracted_text: Optional pre-extracted text
             
         Returns:
-            Tuple of (best_template, confidence, top_3_alternatives)
+            (matched_template, confidence_score, suggested_templates)
         """
+        logger.info("\n" + "=" * 80)
+        logger.info("🎯 TEMPLATE_MATCHING: Starting template matching algorithm")
+        logger.info("=" * 80)
+        logger.info(f"  Input image size: {image.size}")
+        logger.info(f"  Input image mode: {image.mode}")
+        logger.info(f"  Templates to evaluate: {len(templates)}")
+        
         if not templates:
-            logger.warning("No templates provided for matching")
+            logger.warning("  ⚠️  No templates provided for matching!")
             return None, 0.0, []
         
-        scores = []
+        # Calculate scores for each template
+        scored_templates = []
         
-        for template in templates:
-            try:
-                score = self._calculate_template_score(
-                    image, template, yolo_results, extracted_text
-                )
-                scores.append({
-                    "template": template,
-                    "score": score
-                })
-            except Exception as e:
-                logger.error(f"Error scoring template {template.get('template_id')}: {e}")
-                scores.append({
-                    "template": template,
-                    "score": 0.0
-                })
-        
-        # Sort by score descending
-        scores.sort(key=lambda x: x["score"], reverse=True)
-        
-        # Get best match
-        best = scores[0] if scores else {"template": None, "score": 0.0}
-        best_template = best["template"] if best["score"] >= self.THRESHOLD else None
-        best_score = best["score"]
-        
-        # Get top 3 for suggestions
-        top_3 = [
-            {
-                "template_id": s["template"].get("template_id"),
-                "template_name": s["template"].get("name", "Unknown"),
-                "match_score": round(s["score"], 2),
-                "priority": idx + 1
-            }
-            for idx, s in enumerate(scores[:3])
-        ]
-        
-        return best_template, best_score, top_3
-    
-    def _calculate_template_score(
-        self,
-        image: np.ndarray,
-        template: Dict,
-        yolo_results: Optional[Dict],
-        extracted_text: Optional[str]
-    ) -> float:
-        """Calculate weighted score for a template"""
-        
-        # 1. Text Pattern Score (35%)
-        text_score = self._calculate_text_score(extracted_text, template)
-        
-        # 2. Visual Feature Score (30%)
-        visual_score = self._calculate_visual_score(yolo_results, template)
-        
-        # 3. Layout Score (20%)
-        layout_score = self._calculate_layout_score(yolo_results, template)
-        
-        # 4. Image Hash Score (15%)
-        image_score = self._calculate_image_score(image, template)
-        
-        # Weighted sum
-        final_score = (
-            text_score * self.TEXT_WEIGHT +
-            visual_score * self.VISUAL_WEIGHT +
-            layout_score * self.LAYOUT_WEIGHT +
-            image_score * self.IMAGE_WEIGHT
-        )
-        
-        logger.debug(
-            f"Template {template.get('template_id')}: "
-            f"text={text_score:.2f}, visual={visual_score:.2f}, "
-            f"layout={layout_score:.2f}, image={image_score:.2f}, "
-            f"final={final_score:.2f}"
-        )
-        
-        return final_score
-    
-    def _calculate_text_score(self, extracted_text: Optional[str], template: Dict) -> float:
-        """Calculate text pattern matching score (35%)"""
-        if not extracted_text or not template.get("identification_patterns"):
-            return 0.0
-        
-        patterns = template.get("identification_patterns", [])
-        if not patterns:
-            return 0.0
-        
-        extracted_text = extracted_text.lower()
-        
-        matched_weight = 0.0
-        total_weight = 0.0
-        
-        for pattern_obj in patterns:
-            pattern = pattern_obj.get("pattern", "").lower()
-            weight = pattern_obj.get("weight", 1.0)
-            total_weight += weight
+        for idx, template in enumerate(templates, 1):
+            template_id = template.get("template_id", "Unknown")
+            template_name = template.get("template_name", "Unknown")
+            threshold = template.get("identification", {}).get("confidence_threshold", 0.75)
             
-            # Check if pattern exists in text
-            if pattern in extracted_text:
-                matched_weight += weight
-            # Also try regex matching
-            elif re.search(re.escape(pattern), extracted_text, re.IGNORECASE):
-                matched_weight += weight
+            logger.info("\n" + "-" * 80)
+            logger.info(f"📋 EVALUATING TEMPLATE {idx}/{len(templates)}")
+            logger.info("-" * 80)
+            logger.info(f"  Template ID: {template_id}")
+            logger.info(f"  Template Name: {template_name}")
+            logger.info(f"  Confidence Threshold: {threshold}")
+            
+            # Calculate component scores with detailed logging
+            scores = {}
+            
+            # 1. Text Pattern Matching (35%)
+            logger.info("\n  🔍 COMPONENT 1: TEXT PATTERN MATCHING (Weight: 35%)")
+            logger.info("  " + "-" * 76)
+            scores["text"] = self._calculate_text_score(image, template)
+            weighted_text = scores["text"] * self.weights["text"]
+            logger.info(f"  ✓ Text Score: {scores['text']:.4f}")
+            logger.info(f"  ✓ Weighted Contribution: {scores['text']:.4f} × {self.weights['text']} = {weighted_text:.4f}")
+            
+            # 2. Visual Feature Comparison (30%)
+            logger.info("\n  🎨 COMPONENT 2: VISUAL FEATURE COMPARISON (Weight: 30%)")
+            logger.info("  " + "-" * 76)
+            scores["visual"] = self._calculate_visual_score(image, template)
+            weighted_visual = scores["visual"] * self.weights["visual"]
+            logger.info(f"  ✓ Visual Score: {scores['visual']:.4f}")
+            logger.info(f"  ✓ Weighted Contribution: {scores['visual']:.4f} × {self.weights['visual']} = {weighted_visual:.4f}")
+            
+            # 3. Layout Similarity (20%)
+            logger.info("\n  📐 COMPONENT 3: LAYOUT SIMILARITY (Weight: 20%)")
+            logger.info("  " + "-" * 76)
+            scores["layout"] = self._calculate_layout_score(image, template)
+            weighted_layout = scores["layout"] * self.weights["layout"]
+            logger.info(f"  ✓ Layout Score: {scores['layout']:.4f}")
+            logger.info(f"  ✓ Weighted Contribution: {scores['layout']:.4f} × {self.weights['layout']} = {weighted_layout:.4f}")
+            
+            # 4. Image Hash Comparison (15%)
+            logger.info("\n  #️⃣ COMPONENT 4: IMAGE HASH COMPARISON (Weight: 15%)")
+            logger.info("  " + "-" * 76)
+            scores["image_hash"] = self._calculate_image_hash_score(image, template)
+            weighted_hash = scores["image_hash"] * self.weights["image_hash"]
+            logger.info(f"  ✓ Image Hash Score: {scores['image_hash']:.4f}")
+            logger.info(f"  ✓ Weighted Contribution: {scores['image_hash']:.4f} × {self.weights['image_hash']} = {weighted_hash:.4f}")
+            
+            # Calculate weighted overall score
+            overall_score = (
+                scores["text"] * self.weights["text"] +
+                scores["visual"] * self.weights["visual"] +
+                scores["layout"] * self.weights["layout"] +
+                scores["image_hash"] * self.weights["image_hash"]
+            )
+            
+            # Detailed calculation breakdown
+            logger.info("\n  📊 FINAL SCORE CALCULATION:")
+            logger.info("  " + "-" * 76)
+            logger.info(f"  Text:       {scores['text']:.4f} × {self.weights['text']} = {weighted_text:.4f}")
+            logger.info(f"  Visual:     {scores['visual']:.4f} × {self.weights['visual']} = {weighted_visual:.4f}")
+            logger.info(f"  Layout:     {scores['layout']:.4f} × {self.weights['layout']} = {weighted_layout:.4f}")
+            logger.info(f"  Image Hash: {scores['image_hash']:.4f} × {self.weights['image_hash']} = {weighted_hash:.4f}")
+            logger.info("  " + "-" * 76)
+            logger.info(f"  🎯 OVERALL SCORE: {overall_score:.4f} ({overall_score * 100:.2f}%)")
+            logger.info(f"  📏 THRESHOLD:     {threshold:.4f} ({threshold * 100:.2f}%)")
+            
+            # Determine pass/fail
+            passes_threshold = overall_score >= threshold
+            status = "✅ PASSES" if passes_threshold else "❌ FAILS"
+            logger.info(f"  🏁 STATUS: {status}")
+            
+            scored_templates.append({
+                "template": template,
+                "template_id": template_id,
+                "template_name": template_name,
+                "match_score": overall_score,
+                "score_breakdown": scores,
+                "weighted_scores": {
+                    "text": weighted_text,
+                    "visual": weighted_visual,
+                    "layout": weighted_layout,
+                    "image_hash": weighted_hash
+                },
+                "confidence_breakdown": {
+                    "text_similarity": scores["text"],
+                    "visual_similarity": scores["visual"],
+                    "layout_similarity": scores["layout"],
+                    "image_hash_similarity": scores["image_hash"]
+                },
+                "passes_threshold": passes_threshold
+            })
         
-        score = matched_weight / total_weight if total_weight > 0 else 0.0
-        return min(score, 1.0)
-    
-    def _calculate_visual_score(self, yolo_results: Optional[Dict], template: Dict) -> float:
-        """Calculate visual feature score (30%)"""
-        if not yolo_results or not template.get("region_config"):
-            return 0.5  # Neutral score if no YOLO results
+        # Sort by score (highest first)
+        scored_templates.sort(key=lambda x: x["match_score"], reverse=True)
         
-        region_config = template.get("region_config", {})
-        expected_regions = region_config.get("regions", [])
+        # Get best template
+        best_template = scored_templates[0]
+        threshold = best_template["template"].get("identification", {}).get("confidence_threshold", 0.75)
         
-        if not expected_regions:
-            return 0.5
+        logger.info("\n" + "=" * 80)
+        logger.info("📊 MATCHING RESULTS SUMMARY")
+        logger.info("=" * 80)
+        logger.info(f"  🥇 Best Match: {best_template['template_name']}")
+        logger.info(f"  📈 Score: {best_template['match_score']:.4f} ({best_template['match_score'] * 100:.2f}%)")
+        logger.info(f"  📏 Threshold: {threshold:.4f} ({threshold * 100:.2f}%)")
         
-        # Get confidence scores for detected regions
-        confidences = []
-        for region in expected_regions:
-            region_name = region.get("name", "")
-            # Check if this region was detected by YOLO
-            if region_name in yolo_results.get("detected_regions", {}):
-                conf = yolo_results["detected_regions"][region_name].get("confidence", 0.0)
-                confidences.append(conf)
-        
-        # Average confidence
-        if confidences:
-            return sum(confidences) / len(confidences)
+        if best_template['match_score'] >= threshold:
+            logger.info(f"  ✅ STATUS: TEMPLATE MATCHED!")
+            logger.info(f"  ✨ Margin: +{(best_template['match_score'] - threshold) * 100:.2f}% above threshold")
         else:
-            return 0.3  # Low score if no regions matched
+            logger.info(f"  ❌ STATUS: NO MATCH (Below threshold)")
+            logger.info(f"  ⚠️  Gap: -{(threshold - best_template['match_score']) * 100:.2f}% below threshold")
+        
+        # Log all template rankings
+        logger.info(f"\n  📋 Template Rankings:")
+        for i, scored in enumerate(scored_templates, 1):
+            status_icon = "✅" if scored['passes_threshold'] else "❌"
+            logger.info(f"    {i}. {status_icon} {scored['template_name']}: {scored['match_score']:.4f}")
+        
+        # Prepare suggestions (top 5)
+        suggestions = []
+        for i, scored in enumerate(scored_templates[:5], 1):
+            suggestions.append({
+                "template_id": scored["template_id"],
+                "template_name": scored["template_name"],
+                "match_score": round(scored["match_score"], 2),
+                "priority": i,
+                "matched_patterns": self._get_matched_patterns(image, scored["template"]),
+                "confidence_breakdown": scored["confidence_breakdown"]
+            })
+        
+        logger.info("=" * 80 + "\n")
+        
+        # Return matched template if above threshold
+        if best_template["match_score"] >= threshold:
+            return best_template["template"], best_template["match_score"], suggestions
+        else:
+            return None, best_template["match_score"], suggestions
     
-    def _calculate_layout_score(self, yolo_results: Optional[Dict], template: Dict) -> float:
-        """Calculate layout similarity score (20%)"""
-        if not yolo_results or not template.get("region_config"):
-            return 0.5  # Neutral score
+    def _calculate_text_score(self, image: Image.Image, template: Dict) -> float:
+        """Calculate text pattern matching score"""
+        patterns = template.get("identification", {}).get("text_patterns", [])
         
-        region_config = template.get("region_config", {})
-        
-        # If using coordinate-based detection, compare positions
-        if region_config.get("detection_method") == "coordinates":
-            coordinate_regions = region_config.get("coordinate_regions", [])
-            detected_regions = yolo_results.get("detected_regions", {})
-            
-            if not coordinate_regions or not detected_regions:
-                return 0.5
-            
-            position_diffs = []
-            
-            for coord_region in coordinate_regions:
-                region_name = coord_region.get("region_name", "")
-                expected_coords = coord_region.get("coordinates", {})
-                
-                if region_name in detected_regions:
-                    detected_box = detected_regions[region_name].get("bbox", {})
-                    
-                    # Calculate position difference (normalized)
-                    x_diff = abs(expected_coords.get("x", 0) - detected_box.get("x", 0))
-                    y_diff = abs(expected_coords.get("y", 0) - detected_box.get("y", 0))
-                    
-                    # Normalize by image size (assume 1000x1000 for now)
-                    normalized_diff = (x_diff + y_diff) / 2000.0
-                    position_diffs.append(normalized_diff)
-            
-            if position_diffs:
-                avg_diff = sum(position_diffs) / len(position_diffs)
-                return max(0.0, 1.0 - avg_diff)
-        
-        return 0.5
-    
-    def _calculate_image_score(self, image: np.ndarray, template: Dict) -> float:
-        """Calculate image similarity score (15%)"""
-        reference_images = template.get("reference_images", [])
-        
-        if not reference_images:
-            return 0.5  # Neutral score if no reference images
-        
-        try:
-            # Convert numpy array to PIL Image
-            if len(image.shape) == 2:
-                pil_image = Image.fromarray(image)
-            else:
-                pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            
-            # Calculate hash of document
-            doc_hash = imagehash.phash(pil_image)
-            
-            # Compare with reference images
-            similarities = []
-            
-            for ref_img_obj in reference_images[:3]:  # Check top 3 reference images
-                ref_url = ref_img_obj.get("image_url", "")
-                
-                # In production, you'd fetch and hash the reference image
-                # For now, we'll use a placeholder score
-                # TODO: Implement actual image fetching and hashing
-                
-                # Placeholder: assume moderate similarity
-                similarities.append(0.6)
-            
-            if similarities:
-                return max(similarities)  # Return best similarity
-            else:
-                return 0.5
-                
-        except Exception as e:
-            logger.error(f"Error calculating image hash: {e}")
+        if not patterns:
+            logger.info("    ⚠️  No text patterns configured")
             return 0.5
-    
-    def extract_text_from_image(self, image: np.ndarray) -> str:
-        """Extract text from image using OCR"""
+        
+        logger.info(f"    Configured patterns: {len(patterns)}")
+        for i, pattern in enumerate(patterns, 1):
+            logger.info(f"      {i}. \"{pattern}\"")
+        
         try:
             import pytesseract
+            text = pytesseract.image_to_string(image).lower()
+            logger.info(f"    Extracted text length: {len(text)} characters")
             
-            # Convert to PIL Image
-            if len(image.shape) == 2:
-                pil_image = Image.fromarray(image)
-            else:
-                pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            # Count pattern matches
+            matches = 0
+            for pattern in patterns:
+                if pattern.lower() in text:
+                    matches += 1
+                    logger.info(f"      ✅ MATCH: \"{pattern}\" found in document")
+                else:
+                    logger.info(f"      ❌ MISS:  \"{pattern}\" not found")
             
-            # Extract text
-            text = pytesseract.image_to_string(pil_image)
-            return text
+            score = matches / len(patterns)
+            logger.info(f"    Result: {matches}/{len(patterns)} patterns matched = {score:.4f}")
+            return score
+            
+        except ImportError:
+            logger.warning("    ⚠️  pytesseract not available, using placeholder score")
+            return 0.5
+        except Exception as e:
+            logger.error(f"    ❌ Error: {e}")
+            return 0.0
+    
+    def _calculate_visual_score(self, image: Image.Image, template: Dict) -> float:
+        """Calculate visual feature similarity"""
+        ref_images = template.get("identification", {}).get("reference_images", [])
+        
+        logger.info(f"    Reference images configured: {len(ref_images)}")
+        
+        if not ref_images:
+            logger.info("    ⚠️  No reference images, using placeholder score")
+            return 0.5
+        
+        for i, ref in enumerate(ref_images, 1):
+            logger.info(f"      {i}. {ref.get('file_path', 'N/A')}")
+        
+        # TODO: Implement actual histogram comparison
+        logger.info("    ℹ️  Visual comparison not yet implemented")
+        logger.info("    Using placeholder score: 0.7000")
+        return 0.7
+    
+    def _calculate_layout_score(self, image: Image.Image, template: Dict) -> float:
+        """Calculate layout similarity"""
+        yolo_config = template.get("region_config", {}).get("yolo_config", {})
+        classes = yolo_config.get("classes", [])
+        
+        logger.info(f"    Region classes configured: {len(classes)}")
+        for cls in classes:
+            logger.info(f"      - {cls.get('region_name')}")
+        
+        if not classes:
+            logger.info("    ⚠️  No region classes, using placeholder score")
+            return 0.5
+        
+        # TODO: Run YOLO and compare detected regions
+        logger.info("    ℹ️  Layout comparison not yet implemented")
+        logger.info("    Using placeholder score: 0.6500")
+        return 0.65
+    
+    def _calculate_image_hash_score(self, image: Image.Image, template: Dict) -> float:
+        """Calculate perceptual image hash similarity"""
+        ref_images = template.get("identification", {}).get("reference_images", [])
+        
+        logger.info(f"    Reference images for hashing: {len(ref_images)}")
+        
+        if not ref_images:
+            logger.info("    ⚠️  No reference images, using placeholder score")
+            return 0.5
+        
+        try:
+            input_hash = imagehash.average_hash(image)
+            logger.info(f"    Input image hash: {input_hash}")
+            
+            # TODO: Load reference images and compare hashes
+            logger.info("    ℹ️  Hash comparison not yet implemented")
+            logger.info("    Using placeholder score: 0.6000")
+            return 0.6
             
         except Exception as e:
-            logger.error(f"Error extracting text: {e}")
-            return ""
+            logger.error(f"    ❌ Error calculating hash: {e}")
+            return 0.0
+    
+    def _get_matched_patterns(self, image: Image.Image, template: Dict) -> List[str]:
+        """Get list of text patterns that matched"""
+        patterns = template.get("identification", {}).get("text_patterns", [])
+        
+        try:
+            import pytesseract
+            text = pytesseract.image_to_string(image).lower()
+            return [p for p in patterns if p.lower() in text]
+        except:
+            return []

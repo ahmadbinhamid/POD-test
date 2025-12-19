@@ -55,3 +55,18 @@ ClientPackage_Linux
 
 # Specs
 EOF
+
+logs_api.txt
+logs_lmdeploy.txt
+logs_pixtral.txt
+
+# Backups
+*.backup
+*_backup_*/
+
+# Python cache
+*.pyc
+*.pyo
+
+# Logs
+*.log

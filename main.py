@@ -450,6 +450,11 @@ def bol_detect_regions(image: str) -> models.Regions:
     log_detection_stats(results, "BOL Region Detection")
     
     # Log detected regions
+    logger.info(f"""
+        ╔═══════════════════════════════════════════════════════════╗
+        ║ 🎯 BOL REGION DETECTION START                             ║
+        ╚═══════════════════════════════════════════════════════════╝
+            """)
     detected_regions = []
     for result in results:
         if result.boxes:
@@ -493,6 +498,18 @@ def bol_detect_regions(image: str) -> models.Regions:
                     logger.info(f"Detected {region_name} with confidence: {conf:.2f}")
                 else:
                     logger.warning(f"Rejected {region_name} due to poor quality")
+
+    
+    logger.info(f"""
+        ╔═══════════════════════════════════════════════════════════╗
+        ║ 🎯 BOL REGION DETECTION COMPLETE                          ║
+        ╠═══════════════════════════════════════════════════════════╣
+        ║ Stamp:             {'✓ Detected' if 'stamp' in boxes else '✗ Not Found':<36} ║
+        ║ Bill of Lading:    {'✓ Detected' if 'bill_of_lading' in boxes else '✗ Not Found':<36} ║
+        ║ Customer Order:    {'✓ Detected' if 'customer_order_info' in boxes else '✗ Not Found':<36} ║
+        ║ Signatures:        {'✓ Detected' if 'signatures' in boxes else '✗ Not Found':<36} ║
+        ╚═══════════════════════════════════════════════════════════╝
+            """)
     
     return models.Regions(**boxes)
 
@@ -534,7 +551,14 @@ def classify_documents(images: List[str]) -> Dict[str, List[str]]:
     Returns:
         Dictionary of classified regions by type
     """
-    logger.info(f"📄 Starting document classification: {datetime.now()}")
+    logger.info(f"""
+        ╔═══════════════════════════════════════════════════════════╗
+        ║ 📄 DOCUMENT CLASSIFICATION START                          ║
+        ╠═══════════════════════════════════════════════════════════╣
+        ║ Total Images: {len(images):<42} ║
+        ║ Timestamp:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):<42} ║
+        ╚═══════════════════════════════════════════════════════════╝
+            """)
     
     processed_images = []
     for image in images:
@@ -570,8 +594,16 @@ def classify_documents(images: List[str]) -> Dict[str, List[str]]:
                             Image.fromarray(save_one_box(box, im=result.orig_img, save=False))
                         )
                     )
+    logger.info(f"""
+        ╔═══════════════════════════════════════════════════════════╗
+        ║ 📄 CLASSIFICATION COMPLETE                                ║
+        ╠═══════════════════════════════════════════════════════════╣
+        ║ BOL Pages:     {len(boxes.get('BOL', [])):<42} ║
+        ║ Receipt Pages: {len(boxes.get('receipt', [])):<42} ║
+        ║ Other Pages:   {len(boxes.get('others', [])):<42} ║
+        ╚═══════════════════════════════════════════════════════════╝
+            """)
     
-    logger.info(f"📄 Document classification complete: {datetime.now()}")
     return dict(boxes)
 
 
